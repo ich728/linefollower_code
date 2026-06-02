@@ -1,0 +1,11 @@
+build/
+.mxproject
+.settings/
+*.su
+*.o
+*.d
+*.elf
+*.hex
+*.bin
+*.map
+compile_commands.json
