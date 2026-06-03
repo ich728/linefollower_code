@@ -17,14 +17,14 @@
 /* USER CODE BEGIN PD */
 /* ======================== 控制參數 ======================== */
 #define LOOP_MS         10       /* 控制迴圈週期 (100Hz)          */
-#define BASE_SPEED      500      /* 基底速度 PWM duty (0-999)     */
+#define BASE_SPEED      150      /* 基底速度 PWM duty (0-999)     */
 #define FAN_SPEED_US    1250     /* 風扇轉速 µs (上限)          */
 #define TARGET_DIST_MM  10000    /* 一圈總長 mm（現場調整）       */
 
 /* PID 參數 (初始值，透過 OLED + 按鍵可調) */
-#define KP_INIT         1.5f
-#define KI_INIT         0.02f
-#define KD_INIT         12.0f
+#define KP_INIT         4.50f
+#define KI_INIT         0.00f
+#define KD_INIT         0.00f
 #define I_LIMIT         300.0f
 #define OUTPUT_LIMIT    300.0f
 
@@ -185,14 +185,17 @@ static void OLED_ShowDebug(State_t state, float error, uint16_t speed,
         case STATE_OOB:      OLED_Str("OUT OF BOUNDS!", 0, 0);   break;
     }
 
-    /* Row 2: 誤差 bar */
+    /* Row 2: 誤差 (整數顯示, 避免 nano.specs 不支援 float printf) */
     char buf[24];
     if (error > 800.0f) {
         snprintf(buf, sizeof(buf), "Line: LOST");
     } else if (error < -800.0f) {
         snprintf(buf, sizeof(buf), "Line: FULL");
     } else {
-        snprintf(buf, sizeof(buf), "E:%+5.1fmm S:%3u", (double)error, speed);
+        int e_int = (int)error;
+        int e_dec = (int)((error - (float)e_int) * 10.0f);
+        if (e_dec < 0) e_dec = -e_dec;
+        snprintf(buf, sizeof(buf), "E:%+4d.%d S:%3u", e_int, e_dec, speed);
     }
     OLED_Str(buf, 0, 2);
 
@@ -244,8 +247,6 @@ int main(void)
 
     /* 馬達初始化 */
     Motor_Init();
-    Fan_SetDir(1);
-
     /* PID 初始化 */
     PID_t pid_pos;
     PID_Init(&pid_pos, KP_INIT, KI_INIT, KD_INIT, I_LIMIT, OUTPUT_LIMIT);
@@ -253,27 +254,6 @@ int main(void)
     /* ===== OLED 啟動提示 ===== */
     OLED_Init();
     OLED_Clear();
-
-    /* ESC 油門校準: 1940µs → 3s → 1100µs */
-    OLED_Clear();
-    OLED_Str("ESC CAL", 18, 0);
-    OLED_Str("MAX: 1940us", 6, 2);
-    OLED_Flush();
-    TIM4->CCR3 = 194;   /* 直接寫 ticks, 繞過 Fan_SetSpeed 上限 */
-    HAL_Delay(3000);
-
-    OLED_Str("MIN: 1100us", 6, 4);
-    OLED_Flush();
-    TIM4->CCR3 = 110;
-    HAL_Delay(1500);
-
-    /* 編碼器狀態 */
-    OLED_Clear();
-    OLED_Str("ENC: TIM1+TIM8", 0, 2);
-    OLED_Flush();
-    HAL_Delay(300);
-
-    /* 風扇保持 1100µs (不啟動)，按鍵後才加速 */
 
     /* 就緒 */
     OLED_Clear();
@@ -301,7 +281,6 @@ int main(void)
         static uint8_t btn_db_cnt;
         static uint8_t btn_state;
         static uint8_t btn_prev;
-        static uint32_t btn_press_tick;
 
         /* Debounce */
         if (btn_raw == btn_state) {
@@ -314,43 +293,14 @@ int main(void)
             }
         }
 
-        /* 按下瞬間 → 記錄時間 */
+        /* 按鍵觸發 */
         uint8_t btn_rising = btn_state && !btn_prev;
-        uint8_t btn_falling = !btn_state && btn_prev;
 
-        if (btn_rising) {
-            btn_press_tick = now;
-        }
-
-        /* 長按期間：緩慢提升風扇轉速 (1100→1250 over 2s) */
-        if (btn_state && state == STATE_IDLE) {
-            uint32_t hold_ms = now - btn_press_tick;
-            if (hold_ms < 2000) {
-                uint16_t target = 1100 + (uint16_t)(150 * hold_ms / 2000);
-                if (target > 1100) Fan_SetSpeed(target);
-            } else {
-                Fan_SetSpeed(1250);
-            }
-        }
-
-        /* 放開按鍵 → 長短按判斷 */
-        if (btn_falling) {
-            uint32_t hold_ms = now - btn_press_tick;
-            if (hold_ms < 500) {
-                /* 短按：啟動馬達 + 風扇 */
-                if (state == STATE_IDLE) {
-                    state = STATE_RUNNING;
-                    start_time = now;
-                    elapsed_ms = 0;
-                    PID_Reset(&pid_pos);
-                    Fan_SetSpeed(FAN_SPEED_US);
-                }
-            } else {
-                /* 長按：風扇已提速，保持 IDLE，風扇回到最低 */
-                if (state == STATE_IDLE) {
-                    Fan_SetSpeed(1100);
-                }
-            }
+        if (btn_rising && state == STATE_IDLE) {
+            state = STATE_RUNNING;
+            start_time = now;
+            elapsed_ms = 0;
+            PID_Reset(&pid_pos);
         }
 
         btn_prev = btn_state;
@@ -535,7 +485,6 @@ static void MX_GPIO_Init(void)
     HAL_GPIO_WritePin(PORT_MOTOR, PIN_STBY, GPIO_PIN_SET);  /* STBY = HIGH */
     OLED_DC_LO();
     OLED_RES_HI();
-    Fan_SetDir(1);
     Motor_Coast();
 }
 
