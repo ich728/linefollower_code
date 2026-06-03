@@ -1,133 +1,20 @@
 {
     "version": "0.2.0",
     "configurations": [
-        /* ═══════════════════════════════════════════════════════════════
-           STM32CubeIDE 原生 (需 STM32 VS Code 擴展)
-           ════════════════════════════════════════════════════════════ */
         {
-            "type": "stgdbtarget",
-            "request": "launch",
-            "name": "🔵 STM32Cube: Launch + Debug",
-            "origin": "snippet",
-            "cwd": "${workspaceFolder}",
-            "preBuild": "${command:st-stm32-ide-debug-launch.build}",
-            "program": "${command:st-stm32-ide-debug-launch.get-projects-binary-from-context1}",
-            "gdb": "${command:st-stm32-ide-debug-launch.get-gdb-executable}",
-            "deviceName": "${command:st-stm32-ide-debug-launch.get-device-name}",
-            "deviceCore": "${command:st-stm32-ide-debug-launch.get-core-name}",
-            "deviceTrustzone": "${command:st-stm32-ide-debug-launch.get-trustzone-status}",
-            "serverExe": "",
-            "serverParameters": [],
-            "serverHost": "localhost",
-            "serverPort": "",
-            "serverCwd": "",
-            "runEntry": "main",
-            "imagesAndSymbols": [
-                {
-                    "imageFileName": "${command:st-stm32-ide-debug-launch.get-projects-binary-from-context1}",
-                    "imageOffset": "",
-                    "symbolFileName": "${command:st-stm32-ide-debug-launch.get-projects-binary-from-context1}",
-                    "symbolOffset": ""
-                }
-            ]
-        },
-        {
-            "type": "stgdbtarget",
-            "request": "attach",
-            "name": "🔵 STM32Cube: Attach GDB Client",
-            "origin": "snippet",
-            "cwd": "${workspaceFolder}",
-            "preBuild": "${command:st-stm32-ide-debug-launch.build}",
-            "program": "${command:st-stm32-ide-debug-launch.get-projects-binary-from-context1}",
-            "gdb": "${command:st-stm32-ide-debug-launch.get-gdb-executable}",
-            "serverHost": "localhost",
-            "serverPort": "${command:st-stm32-ide-debug-launch.get-server-port}",
-            "runEntry": "main",
-            "imagesAndSymbols": [
-                {
-                    "imageFileName": "${command:st-stm32-ide-debug-launch.get-projects-binary-from-context1}",
-                    "imageOffset": "",
-                    "symbolFileName": "${command:st-stm32-ide-debug-launch.get-projects-binary-from-context1}",
-                    "symbolOffset": ""
-                }
-            ]
-        },
-
-        /* ═══════════════════════════════════════════════════════════════
-           Cortex-Debug: 使用 CMake Tools 自動構建 (推薦)
-           按 F5 前需先執行一次 Ctrl+Shift+P → CMake: Configure
-           ════════════════════════════════════════════════════════════ */
-        {
+            "name": "Debug (OpenOCD + GDB)",
             "type": "cortex-debug",
             "request": "launch",
-            "name": "🟢 Cortex-Debug: OpenOCD",
             "cwd": "${workspaceFolder}",
             "executable": "${workspaceFolder}/build/Debug/LineFollower.elf",
-            "servertype": "openocd",
-            "configFiles": [
-                "interface/stlink.cfg",
-                "target/stm32f4x.cfg"
-            ],
-            "runToEntryPoint": "main",
-            "preLaunchTask": "🔄 CMake: Configure + Build",
-            "preRestartCommands": [
-                "monitor reset halt",
-                "monitor gdb_sync",
-                "thbreak main"
-            ],
-            "svdFile": ".vscode/STM32F407.svd",
-            "showDevDebugOutput": "raw",
-            "armToolchainPath": "C:/Program Files (x86)/Arm GNU Toolchain arm-none-eabi/14.2 rel1/bin"
-        },
-        {
-            "type": "cortex-debug",
-            "request": "launch",
-            "name": "🟢 Cortex-Debug: ST-Link GDB Server",
-            "cwd": "${workspaceFolder}",
-            "executable": "${workspaceFolder}/build/Debug/LineFollower.elf",
-            "servertype": "stlink",
-            "serverpath": "C:/Program Files/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/ST-LINK_gdbserver.exe",
-            "device": "STM32F407VG",
-            "interface": "swd",
-            "serialNumber": "",
-            "runToEntryPoint": "main",
-            "preLaunchTask": "🔄 CMake: Configure + Build",
-            "svdFile": ".vscode/STM32F407.svd",
-            "armToolchainPath": "C:/Program Files (x86)/Arm GNU Toolchain arm-none-eabi/14.2 rel1/bin"
-        },
-        {
-            "type": "cortex-debug",
-            "request": "launch",
-            "name": "🟡 Cortex-Debug: PyOCD",
-            "cwd": "${workspaceFolder}",
-            "executable": "${workspaceFolder}/build/Debug/LineFollower.elf",
-            "servertype": "pyocd",
-            "serverpath": "pyocd",
+            "servertype": "external",
+            "gdbTarget": "localhost:3333",
             "device": "STM32F407VG",
             "runToEntryPoint": "main",
-            "preLaunchTask": "🔄 CMake: Configure + Build",
-            "svdFile": ".vscode/STM32F407.svd",
-            "armToolchainPath": "C:/Program Files (x86)/Arm GNU Toolchain arm-none-eabi/14.2 rel1/bin"
-        },
-        {
-            "type": "cortex-debug",
-            "request": "launch",
-            "name": "📟 Flash Only (不除錯)",
-            "cwd": "${workspaceFolder}",
-            "executable": "${workspaceFolder}/build/Debug/LineFollower.elf",
-            "servertype": "openocd",
-            "configFiles": [
-                "interface/stlink.cfg",
-                "target/stm32f4x.cfg"
-            ],
-            "runToEntryPoint": "main",
-            "preLaunchTask": "🔄 CMake: Configure + Build",
-            "postLaunchCommands": [
-                "continue",
-                "monitor resume"
-            ],
-            "svdFile": ".vscode/STM32F407.svd",
-            "armToolchainPath": "C:/Program Files (x86)/Arm GNU Toolchain arm-none-eabi/14.2 rel1/bin"
+            "gdbPath": "C:/Users/ICH728/AppData/Local/stm32cube/bundles/gnu-tools-for-stm32/14.3.1+st.2/bin/arm-none-eabi-gdb.exe",
+            "preLaunchTask": "OpenOCD (flash once)",
+            "preLaunchCommands": [],
+            "postLaunchCommands": []
         }
     ]
 }

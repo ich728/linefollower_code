@@ -5,14 +5,14 @@
   *
   *   PWMA = PA1 (TIM2_CH2), PWMB = PA3 (TIM2_CH4)
   *   同屬 TIM2，單次更新兩個 CCR 保證同步輸出無相位抖動
-  *   ESC  = PA7 (TIM14_CH1), DIR = PB1
+  *   ESC  = PB8 (TIM4_CH3), DIR = PB1
   ******************************************************************************
   */
 #include "pinout.h"
 #include "motor.h"
 #include "stm32f4xx_hal.h"
 
-/* ======================== TIM2 PWM 初始化 ======================== */
+/* ======================== TIM2 PWM 初始化 (馬達) ================== */
 void Motor_TIM_Init(void)
 {
     /* TIM2 clock enable */
@@ -84,32 +84,22 @@ void Motor_SetSpeed(int16_t left_speed, int16_t right_speed)
     Motor_SetPWM(pwm_l, pwm_r);
 }
 
-/* ======================== ESC 負壓風扇 ======================== */
+/* ======================== ESC 負壓風扇 (同 Demo: TIM4_CH3, PB8) ====== */
 void Fan_Init(void)
 {
-    /* TIM14 clock enable */
-    RCC->APB1ENR |= RCC_APB1ENR_TIM14EN;
-
-    /* PSC=159, ARR=1999
-       16MHz / (159+1) = 100kHz
-       100kHz / (1999+1) = 50Hz (20ms, Futaba 標準) */
-    TIM14->PSC  = 159;
-    TIM14->ARR  = 1999;
-    TIM14->CNT  = 0;
-
-    /* CH1: PWM mode 1, preload enable */
-    TIM14->CCMR1 &= ~(TIM_CCMR1_OC1M | TIM_CCMR1_OC1PE);
-    TIM14->CCMR1 |=  (6 << TIM_CCMR1_OC1M_Pos) | TIM_CCMR1_OC1PE;
-    TIM14->CCER  |=  TIM_CCER_CC1E;
-    TIM14->CCR1  =  ESC_MIN_US;  /* 初始停止 */
-
-    /* Enable TIM14 */
-    TIM14->CR1 |= TIM_CR1_CEN;
+    RCC->APB1ENR |= RCC_APB1ENR_TIM4EN;
+    TIM4->PSC  = 159;
+    TIM4->ARR  = 1999;
+    TIM4->CCR3 = 110;                  /* 110 ticks = 1100µs */
+    TIM4->CCMR2 = (6 << 4) | (1 << 3); /* CH3 PWM mode 1, preload */
+    TIM4->CCER  = TIM_CCER_CC3E;
+    TIM4->CR1   = TIM_CR1_CEN;
 }
 
+/* us: 1100-2000 µs → ticks = us/10 */
 void Fan_SetSpeed(uint16_t us)
 {
-    if (us < ESC_MIN_US) us = ESC_MIN_US;
-    if (us > ESC_MAX_US) us = ESC_MAX_US;
-    TIM14->CCR1 = us;
+    if (us < 1100) us = 1100;
+    if (us > 1250) us = 1250;  /* 上限保護 */
+    TIM4->CCR3 = us / 10;
 }

@@ -2,95 +2,20 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "🔨 CMake: Build",
-            "type": "cmake",
-            "command": "build",
-            "targets": ["all"],
+            "label": "Build & Flash",
+            "type": "shell",
+            "command": "${workspaceFolder}/flash.bat",
             "group": {
                 "kind": "build",
                 "isDefault": true
             },
-            "problemMatcher": ["$gcc"],
-            "detail": "CMake build (需先 Configure)"
-        },
-        {
-            "label": "🔨 CMake: Build (shell)",
-            "type": "shell",
-            "command": "cmake",
-            "args": [
-                "--build", "${workspaceFolder}/build/Debug",
-                "--config", "Debug",
-                "-j", "4"
-            ],
-            "group": "none",
-            "problemMatcher": ["$gcc"],
-            "detail": "Shell-based build (fallback)"
-        },
-        {
-            "label": "⚙️ CMake: Configure",
-            "type": "shell",
-            "command": "cmake",
-            "args": [
-                "-B", "${workspaceFolder}/build/Debug",
-                "-S", "${workspaceFolder}",
-                "-DCMAKE_BUILD_TYPE=Debug",
-                "-DCMAKE_TOOLCHAIN_FILE=${workspaceFolder}/cmake/gcc-arm-none-eabi.cmake",
-                "-DCMAKE_C_COMPILER=arm-none-eabi-gcc",
-                "-DCMAKE_CXX_COMPILER=arm-none-eabi-g++",
-                "-DCMAKE_ASM_COMPILER=arm-none-eabi-gcc"
-            ],
-            "group": "none",
             "problemMatcher": [],
-            "detail": "Configure CMake (不使用 preset，確保兼容性)"
-        },
-        {
-            "label": "🔄 CMake: Configure + Build",
-            "dependsOn": [
-                "⚙️ CMake: Configure",
-                "🔨 CMake: Build (shell)"
-            ],
-            "dependsOrder": "sequence",
-            "group": "none",
-            "problemMatcher": [],
-            "detail": "Full configure + build cycle (F5 前置任務)"
-        },
-        {
-            "label": "🧹 Clean",
-            "type": "shell",
-            "command": "cmake",
-            "args": [
-                "--build", "${workspaceFolder}/build/Debug",
-                "--target", "clean"
-            ],
-            "group": "none",
-            "problemMatcher": [],
-            "detail": "Clean build artifacts"
-        },
-        {
-            "label": "📟 Flash: STM32_Programmer",
-            "type": "shell",
-            "command": "STM32_Programmer_CLI",
-            "args": [
-                "-c", "port=SWD", "freq=4000",
-                "-d", "${workspaceFolder}/build/Debug/LineFollower.elf",
-                "-hardRst"
-            ],
-            "group": "none",
-            "problemMatcher": [],
-            "detail": "Flash via STM32CubeProgrammer CLI"
-        },
-        {
-            "label": "📟 Flash: OpenOCD",
-            "type": "shell",
-            "command": "openocd",
-            "args": [
-                "-f", "interface/stlink.cfg",
-                "-f", "target/stm32f4x.cfg",
-                "-c", "program ${workspaceFolder}/build/Debug/LineFollower.elf verify reset exit"
-            ],
-            "group": "none",
-            "problemMatcher": [],
-            "detail": "Flash via OpenOCD + ST-Link"
+            "options": {
+                "shell": {
+                    "executable": "powershell.exe",
+                    "args": ["-Command"]
+                }
+            }
         }
     ]
 }

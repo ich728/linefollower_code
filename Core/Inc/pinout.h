@@ -25,12 +25,11 @@ extern "C" {
 #define PIN_STBY      GPIO_PIN_4   /* PA4  近 R15 內  馬達致能 STBY        */
 #define PIN_BIN1      GPIO_PIN_5   /* PA5  近 R15 外  右輪 H 橋 B1        */
 #define PIN_BIN2      GPIO_PIN_6   /* PA6  近 R14 內  右輪 H 橋 B2        */
-#define PIN_ESC       GPIO_PIN_7   /* PA7  近 R14 外  負壓風扇 TIM14_CH1   */
 
 #define PORT_MOTOR    GPIOA
-#define PORT_ESC_FAN  GPIOA
 
 /* =========================== PORTB: 控制 ============================== */
+#define PIN_ESC       GPIO_PIN_8   /* PB8  遠 R22 內  負壓風扇 TIM4_CH3    */
 #define PIN_ESC_DIR   GPIO_PIN_1   /* PB1  近 R12 外  風扇方向             */
 #define PIN_IMU_SCK   GPIO_PIN_3   /* PB3  遠 R20 內  IMU SPI 時鐘         */
 #define PIN_IMU_MOSI  GPIO_PIN_5   /* PB5  遠 R20 外  IMU SPI 數據         */
@@ -40,6 +39,7 @@ extern "C" {
 
 #define PORT_IMU      GPIOB
 #define PORT_ESC_DIR  GPIOB
+#define PORT_ESC_FAN  GPIOB
 #define PORT_BTN      GPIOB
 
 /* =========================== PORTC: 右編碼器 =========================== */

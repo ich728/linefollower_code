@@ -18,7 +18,7 @@
 /* ======================== 控制參數 ======================== */
 #define LOOP_MS         10       /* 控制迴圈週期 (100Hz)          */
 #define BASE_SPEED      500      /* 基底速度 PWM duty (0-999)     */
-#define FAN_SPEED_US    1500     /* 風扇固定轉速 µs              */
+#define FAN_SPEED_US    1250     /* 風扇轉速 µs (上限)          */
 #define TARGET_DIST_MM  10000    /* 一圈總長 mm（現場調整）       */
 
 /* PID 參數 (初始值，透過 OLED + 按鍵可調) */
@@ -95,20 +95,35 @@ static const uint8_t font5x8[91][5] = {
 /* ======================== OLED (SPI2, PD3-6) ======================== */
 static uint8_t oled_buf[128][8];
 
-static void spi2_write(uint8_t d)
-{
-    while (!(SPI2->SR & SPI_SR_TXE));
-    *(volatile uint8_t *)&SPI2->DR = d;
-    while (SPI2->SR & SPI_SR_BSY);
-}
-
 #define OLED_DC_LO()  (PORT_OLED->BSRR = (uint32_t)PIN_OLED_DC << 16)
 #define OLED_DC_HI()  (PORT_OLED->BSRR = PIN_OLED_DC)
 #define OLED_RES_LO() (PORT_OLED->BSRR = (uint32_t)PIN_OLED_RES << 16)
 #define OLED_RES_HI() (PORT_OLED->BSRR = PIN_OLED_RES)
+#define OLED_SCK_LO() (PORT_OLED->BSRR = (uint32_t)PIN_OLED_SCK << 16)
+#define OLED_SCK_HI() (PORT_OLED->BSRR = PIN_OLED_SCK)
+#define OLED_MOSI_LO() (PORT_OLED->BSRR = (uint32_t)PIN_OLED_MOSI << 16)
+#define OLED_MOSI_HI() (PORT_OLED->BSRR = PIN_OLED_MOSI)
 
-static void oled_cmd(uint8_t c) { OLED_DC_LO(); spi2_write(c); }
-static void oled_dat(uint8_t d) { OLED_DC_HI(); spi2_write(d); }
+/* 軟體 SPI (bit-bang) — PD4 沒有硬體 SPI2_MOSI */
+static void oled_spi_dly(void) { for (volatile int i = 0; i < 5; i++); }
+
+static void oled_spi_write(uint8_t d)
+{
+    for (int i = 7; i >= 0; i--) {
+        if (d & (1 << i))
+            OLED_MOSI_HI();
+        else
+            OLED_MOSI_LO();
+        oled_spi_dly();
+        OLED_SCK_HI();
+        oled_spi_dly();
+        OLED_SCK_LO();
+        oled_spi_dly();
+    }
+}
+
+static void oled_cmd(uint8_t c) { OLED_DC_LO(); oled_spi_write(c); }
+static void oled_dat(uint8_t d) { OLED_DC_HI(); oled_spi_write(d); }
 
 static void OLED_Init(void)
 {
@@ -117,7 +132,13 @@ static void OLED_Init(void)
     oled_cmd(0xD3); oled_cmd(0x00); oled_cmd(0x40); oled_cmd(0x8D); oled_cmd(0x14);
     oled_cmd(0x20); oled_cmd(0x02); oled_cmd(0xA1); oled_cmd(0xC8); oled_cmd(0xDA); oled_cmd(0x12);
     oled_cmd(0x81); oled_cmd(0xEF); oled_cmd(0xD9); oled_cmd(0xF1); oled_cmd(0xDB); oled_cmd(0x30);
-    oled_cmd(0xA4); oled_cmd(0xA6); oled_cmd(0xAF);
+    oled_cmd(0xA4); oled_cmd(0xA6);
+    /* 清空 GDDRAM 再開顯示，防止開機亂碼 */
+    for (int p = 0; p < 8; p++) {
+        oled_cmd(0xB0 | p); oled_cmd(0x00); oled_cmd(0x10);
+        for (int c = 0; c < 128; c++) oled_dat(0x00);
+    }
+    oled_cmd(0xAF);
 }
 
 static void OLED_Clear(void)
@@ -206,13 +227,7 @@ int main(void)
     SystemClock_Config();
     MX_GPIO_Init();
 
-    /* SPI2 (OLED) — PD3=SCK, PD4=MOSI */
-    RCC->APB1ENR |= RCC_APB1ENR_SPI2EN;
-    SPI2->CR1 = SPI_CR1_MSTR | SPI_CR1_SSI | SPI_CR1_SSM
-              | (2 << 3)          /* BR: fPCLK/8 = 2MHz @ 16MHz */
-              | SPI_CR1_SPE;
-
-    /* TIM2 PWM (馬達) + TIM14 ESC (風扇) */
+    /* TIM2 PWM (馬達) + TIM4 ESC (風扇) */
     Motor_TIM_Init();
     Fan_Init();
 
@@ -229,17 +244,42 @@ int main(void)
 
     /* 馬達初始化 */
     Motor_Init();
-    Fan_SetSpeed(FAN_SPEED_US);
     Fan_SetDir(1);
 
     /* PID 初始化 */
     PID_t pid_pos;
     PID_Init(&pid_pos, KP_INIT, KI_INIT, KD_INIT, I_LIMIT, OUTPUT_LIMIT);
 
-    /* OLED */
+    /* ===== OLED 啟動提示 ===== */
     OLED_Init();
     OLED_Clear();
-    OLED_ShowDebug(STATE_IDLE, 0.0f, 0, 0x00, 0);
+
+    /* ESC 油門校準: 1940µs → 3s → 1100µs */
+    OLED_Clear();
+    OLED_Str("ESC CAL", 18, 0);
+    OLED_Str("MAX: 1940us", 6, 2);
+    OLED_Flush();
+    TIM4->CCR3 = 194;   /* 直接寫 ticks, 繞過 Fan_SetSpeed 上限 */
+    HAL_Delay(3000);
+
+    OLED_Str("MIN: 1100us", 6, 4);
+    OLED_Flush();
+    TIM4->CCR3 = 110;
+    HAL_Delay(1500);
+
+    /* 編碼器狀態 */
+    OLED_Clear();
+    OLED_Str("ENC: TIM1+TIM8", 0, 2);
+    OLED_Flush();
+    HAL_Delay(300);
+
+    /* 風扇保持 1100µs (不啟動)，按鍵後才加速 */
+
+    /* 就緒 */
+    OLED_Clear();
+    OLED_Str("READY", 36, 1);
+    OLED_Str("Press BTN", 24, 3);
+    OLED_Flush();
 
     /* ======================== 主迴圈 ======================== */
     State_t state = STATE_IDLE;
@@ -256,29 +296,64 @@ int main(void)
         float dt = (float)(now - last_loop) / 1000.0f;
         last_loop = now;
 
-        /* ---- 按鍵 (含 debounce) ---- */
+        /* ---- 按鍵 (含 debounce + 長短按) ---- */
         uint8_t btn_raw = (PORT_BTN->IDR & PIN_BTN) ? 1 : 0;
-        static uint8_t btn_debounce_cnt;
+        static uint8_t btn_db_cnt;
         static uint8_t btn_state;
+        static uint8_t btn_prev;
+        static uint32_t btn_press_tick;
 
+        /* Debounce */
         if (btn_raw == btn_state) {
-            btn_debounce_cnt = 0;
+            btn_db_cnt = 0;
         } else {
-            btn_debounce_cnt++;
-            if (btn_debounce_cnt >= 3) {  /* 30ms debounce @ 100Hz */
+            btn_db_cnt++;
+            if (btn_db_cnt >= 3) {  /* 30ms debounce @ 100Hz */
                 btn_state = btn_raw;
-                btn_debounce_cnt = 0;
-                /* 按下事件 */
-                if (btn_state) {
-                    if (state == STATE_IDLE) {
-                        state = STATE_RUNNING;
-                        start_time = now;
-                        elapsed_ms = 0;
-                        PID_Reset(&pid_pos);
-                    }
+                btn_db_cnt = 0;
+            }
+        }
+
+        /* 按下瞬間 → 記錄時間 */
+        uint8_t btn_rising = btn_state && !btn_prev;
+        uint8_t btn_falling = !btn_state && btn_prev;
+
+        if (btn_rising) {
+            btn_press_tick = now;
+        }
+
+        /* 長按期間：緩慢提升風扇轉速 (1100→1250 over 2s) */
+        if (btn_state && state == STATE_IDLE) {
+            uint32_t hold_ms = now - btn_press_tick;
+            if (hold_ms < 2000) {
+                uint16_t target = 1100 + (uint16_t)(150 * hold_ms / 2000);
+                if (target > 1100) Fan_SetSpeed(target);
+            } else {
+                Fan_SetSpeed(1250);
+            }
+        }
+
+        /* 放開按鍵 → 長短按判斷 */
+        if (btn_falling) {
+            uint32_t hold_ms = now - btn_press_tick;
+            if (hold_ms < 500) {
+                /* 短按：啟動馬達 + 風扇 */
+                if (state == STATE_IDLE) {
+                    state = STATE_RUNNING;
+                    start_time = now;
+                    elapsed_ms = 0;
+                    PID_Reset(&pid_pos);
+                    Fan_SetSpeed(FAN_SPEED_US);
+                }
+            } else {
+                /* 長按：風扇已提速，保持 IDLE，風扇回到最低 */
+                if (state == STATE_IDLE) {
+                    Fan_SetSpeed(1100);
                 }
             }
         }
+
+        btn_prev = btn_state;
 
         /* ---- 狀態機 ---- */
         switch (state) {
@@ -369,7 +444,7 @@ static void MX_GPIO_Init(void)
 
     GPIO_InitTypeDef g = {0};
 
-    /* ---- PORTA: 馬達 + ESC ---- */
+    /* ---- PORTA: 馬達 ---- */
     g.Pin   = PIN_AIN1 | PIN_AIN2 | PIN_STBY | PIN_BIN1 | PIN_BIN2;
     g.Mode  = GPIO_MODE_OUTPUT_PP;
     g.Pull  = GPIO_NOPULL;
@@ -390,14 +465,14 @@ static void MX_GPIO_Init(void)
     g.Alternate = GPIO_AF1_TIM2;
     HAL_GPIO_Init(PORT_MOTOR, &g);
 
-    /* ESC_PWM (PA7) — TIM14_CH1, AF9 */
+    /* ---- PORTB: 控制 ---- */
+    /* ESC_PWM (PB8) — TIM4_CH3, AF2 */
     g.Pin       = PIN_ESC;
     g.Mode      = GPIO_MODE_AF_PP;
     g.Pull      = GPIO_NOPULL;
-    g.Alternate = GPIO_AF9_TIM14;
+    g.Alternate = GPIO_AF2_TIM4;
     HAL_GPIO_Init(PORT_ESC_FAN, &g);
 
-    /* ---- PORTB: 控制 ---- */
     /* ESC_DIR (PB1) */
     g.Pin   = PIN_ESC_DIR;
     g.Mode  = GPIO_MODE_OUTPUT_PP;
@@ -432,19 +507,11 @@ static void MX_GPIO_Init(void)
     g.Alternate = GPIO_AF3_TIM8;
     HAL_GPIO_Init(PORT_ENC_R, &g);
 
-    /* ---- PORTD: OLED ---- */
-    /* PD3(SCK), PD4(MOSI) — SPI2, AF5 */
-    g.Pin       = PIN_OLED_SCK | PIN_OLED_MOSI;
-    g.Mode      = GPIO_MODE_AF_PP;
-    g.Pull      = GPIO_NOPULL;
-    g.Speed     = GPIO_SPEED_FREQ_HIGH;
-    g.Alternate = GPIO_AF5_SPI2;
-    HAL_GPIO_Init(PORT_OLED, &g);
-
-    /* PD5(DC), PD6(RES) — GPIO OUT */
-    g.Pin       = PIN_OLED_DC | PIN_OLED_RES;
+    /* ---- PORTD: OLED (軟體 SPI, 全 GPIO OUT) ---- */
+    g.Pin       = PIN_OLED_SCK | PIN_OLED_MOSI | PIN_OLED_DC | PIN_OLED_RES;
     g.Mode      = GPIO_MODE_OUTPUT_PP;
     g.Pull      = GPIO_NOPULL;
+    g.Speed     = GPIO_SPEED_FREQ_HIGH;
     g.Alternate = 0;
     HAL_GPIO_Init(PORT_OLED, &g);
 

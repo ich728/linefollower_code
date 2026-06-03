@@ -1,0 +1,9 @@
+CompileFlags:
+  CompilationDatabase: .
+  Add:
+    - --target=arm-none-eabi
+    - -mcpu=cortex-m4
+
+Diagnostics:
+  ClangTidy:
+    Remove: '*'

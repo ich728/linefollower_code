@@ -6,14 +6,13 @@ set(CMAKE_CXX_COMPILER_ID GNU)
 
 # Some default GCC settings
 # arm-none-eabi- must be part of path environment
-set(TOOLCHAIN_PREFIX                arm-none-eabi-)
-
-set(CMAKE_C_COMPILER                ${TOOLCHAIN_PREFIX}gcc)
-set(CMAKE_ASM_COMPILER              ${CMAKE_C_COMPILER})
-set(CMAKE_CXX_COMPILER              ${TOOLCHAIN_PREFIX}g++)
-set(CMAKE_LINKER                    ${TOOLCHAIN_PREFIX}g++)
-set(CMAKE_OBJCOPY                   ${TOOLCHAIN_PREFIX}objcopy)
-set(CMAKE_SIZE                      ${TOOLCHAIN_PREFIX}size)
+set(TOOLCHAIN_PATH "C:/Users/ICH728/AppData/Local/stm32cube/bundles/gnu-tools-for-stm32/14.3.1+st.2/bin")
+set(CMAKE_C_COMPILER    "${TOOLCHAIN_PATH}/arm-none-eabi-gcc.exe")
+set(CMAKE_ASM_COMPILER  "${TOOLCHAIN_PATH}/arm-none-eabi-gcc.exe")
+set(CMAKE_CXX_COMPILER  "${TOOLCHAIN_PATH}/arm-none-eabi-g++.exe")
+set(CMAKE_LINKER        "${TOOLCHAIN_PATH}/arm-none-eabi-g++.exe")
+set(CMAKE_OBJCOPY       "${TOOLCHAIN_PATH}/arm-none-eabi-objcopy.exe")
+set(CMAKE_SIZE          "${TOOLCHAIN_PATH}/arm-none-eabi-size.exe")
 
 set(CMAKE_EXECUTABLE_SUFFIX_ASM     ".elf")
 set(CMAKE_EXECUTABLE_SUFFIX_C       ".elf")

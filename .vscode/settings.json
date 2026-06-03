@@ -1,89 +1,12 @@
 {
-    /* ═══════════════════════════════════════════
-       編輯器
-       ═══════════════════════════════════════════ */
-    "editor.tabSize": 4,
-    "editor.insertSpaces": true,
-    "editor.renderWhitespace": "boundary",
-    "editor.rulers": [100],
-
-    /* ═══════════════════════════════════════════
-       檔案關聯
-       ═══════════════════════════════════════════ */
-    "files.associations": {
-        "*.h": "c",
-        "*.c": "c",
-        "*.s": "arm-assembly",
-        "*.ld": "linkerscript",
-        "stm32f4xx_hal_rcc.h": "c",
-        "stm32f4xx_hal_gpio.h": "c",
-        "stm32f407xx.h": "c"
-    },
-    "files.exclude": {
-        "**/.git": true,
-        "build": false
-    },
-    "files.watcherExclude": {
-        "build/**": true
-    },
-
-    /* ═══════════════════════════════════════════
-       C/C++ 擴展
-       ═══════════════════════════════════════════ */
-    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
-    "C_Cpp.default.compilerPath": "arm-none-eabi-gcc",
-    "C_Cpp.default.intelliSenseMode": "linux-gcc-arm",
-    "C_Cpp.default.cStandard": "c11",
-    "C_Cpp.default.defines": [
-        "USE_HAL_DRIVER",
-        "STM32F407xx"
+    "cmake.cmakePath": "cube-cmake",
+    "cmake.configureArgs": [
+        "-DCMAKE_COMMAND=cube-cmake"
     ],
-
-    /* ═══════════════════════════════════════════
-       CMake 擴展
-       ═══════════════════════════════════════════ */
-    "cmake.sourceDirectory": "${workspaceFolder}",
-    "cmake.buildDirectory": "${workspaceFolder}/build/${buildType}",
-    "cmake.configureOnOpen": false,
-    "cmake.buildBeforeRun": true,
-    "cmake.configureArgs": [],
-    "cmake.environment": {
-        "PATH": "${env:PATH};C:/Program Files (x86)/Arm GNU Toolchain arm-none-eabi/14.2 rel1/bin"
-    },
-
-    /* ═══════════════════════════════════════════
-       Cortex-Debug 擴展
-       ═══════════════════════════════════════════ */
-    "cortex-debug.variableUseNaturalFormat": true,
-    "cortex-debug.showRTOS": false,
-    "cortex-debug.armToolchainPath": "C:/Program Files (x86)/Arm GNU Toolchain arm-none-eabi/14.2 rel1/bin",
-    "cortex-debug.openocdPath": "C:/OpenOCD/bin/openocd.exe",
-    "cortex-debug.stlinkPath": "C:/Program Files/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/ST-LINK_gdbserver.exe",
-    "cortex-debug.JLinkGDBServerPath": "C:/Program Files/SEGGER/JLink/JLinkGDBServerCL.exe",
-
-    /* ═══════════════════════════════════════════
-       終端機
-       ═══════════════════════════════════════════ */
-    "terminal.integrated.defaultProfile.windows": "Git Bash",
-    "terminal.integrated.env.windows": {
-        "PATH": "${env:PATH};C:/Program Files (x86)/Arm GNU Toolchain arm-none-eabi/14.2 rel1/bin;C:/Program Files (x86)/Arm GNU Toolchain arm-none-eabi/13.3 rel1/bin;C:/Program Files/CMake/bin;C:/OpenOCD/bin"
-    },
-    "terminal.integrated.profiles.windows": {
-        "Git Bash (Env)": {
-            "path": "C:/Program Files/Git/bin/bash.exe",
-            "args": ["--login", "-i"]
-        },
-        "Command Prompt (Env)": {
-            "path": "cmd.exe",
-            "args": ["/k", "${workspaceFolder}\\tools\\setup_env.bat"]
-        }
-    },
-
-    /* ═══════════════════════════════════════════
-       搜尋排除
-       ═══════════════════════════════════════════ */
-    "search.exclude": {
-        "build/**": true,
-        "Drivers/CMSIS/Include/core_*.h": true
-    }
+    "cmake.preferredGenerators": [
+        "Ninja"
+    ],
+    "stm32-for-vscode.openOCDPath": false,
+    "stm32-for-vscode.makePath": false,
+    "stm32-for-vscode.armToolchainPath": false
 }

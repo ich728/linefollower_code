@@ -16,13 +16,13 @@ extern "C" {
 /* ======================== PWM 參數 ======================== */
 #define PWM_MAX        999    /* TIM2 ARR, 1kHz */
 #define PWM_MIN        0
-#define ESC_MIN_US     1000   /* 風扇停止       */
+#define ESC_MIN_US     1100   /* 油門最低       */
 #define ESC_MAX_US     2000   /* 風扇全速       */
 #define ESC_DEFAULT_US  1500  /* 風扇中等       */
 
 /* ======================== 馬達初始化 ======================== */
 void Motor_Init(void);
-void Motor_TIM_Init(void);     /* TIM2 PWM + TIM14 ESC 時鐘配置 */
+void Motor_TIM_Init(void);     /* TIM2 PWM + TIM4 ESC 時鐘配置 */
 
 /* ======================== 馬達控制巨集 ======================== */
 /* 左輪方向 (1 號 N30) */
