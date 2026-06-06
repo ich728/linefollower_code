@@ -18,13 +18,14 @@
 /* ======================== 控制參數 ======================== */
 #define LOOP_MS         10       /* 控制迴圈週期 (100Hz)          */
 #define BASE_SPEED      150      /* 基底速度 PWM duty (0-999)     */
+#define RIGHT_TRIM      35       /* 右輪 PWM 補償 (右偏時增大)     */
 #define FAN_SPEED_US    1250     /* 風扇轉速 µs (上限)          */
 #define TARGET_DIST_MM  10000    /* 一圈總長 mm（現場調整）       */
 
 /* PID 參數 (初始值，透過 OLED + 按鍵可調) */
-#define KP_INIT         4.50f
-#define KI_INIT         0.00f
-#define KD_INIT         0.00f
+#define KP_INIT         0.80f   /* P: 比例反應               */
+#define KI_INIT         0.00f   /* I: 不加                    */
+#define KD_INIT         0.30f   /* D: 阻尼 (加強對慢震)       */
 #define I_LIMIT         300.0f
 #define OUTPUT_LIMIT    300.0f
 
@@ -35,6 +36,7 @@
 /* ======================== 狀態機 ======================== */
 typedef enum {
     STATE_IDLE,          /* 等待按鍵啟動                        */
+    STATE_COUNTDOWN,     /* 倒數 3 秒後啟動                     */
     STATE_RUNNING,       /* 循跡中                              */
     STATE_FINISHED,      /* 完成一圈                            */
     STATE_OOB            /* 出界                                */
@@ -92,6 +94,8 @@ static const uint8_t font5x8[91][5] = {
 /* USER CODE END PD */
 
 /* USER CODE BEGIN 0 */
+static int32_t g_enc_diff;  /* 編碼器差值供 OLED 顯示 */
+
 /* ======================== OLED (SPI2, PD3-6) ======================== */
 static uint8_t oled_buf[128][8];
 
@@ -180,6 +184,13 @@ static void OLED_ShowDebug(State_t state, float error, uint16_t speed,
     /* Row 0: 狀態 */
     switch (state) {
         case STATE_IDLE:     OLED_Str("READY  Press BTN", 0, 0); break;
+        case STATE_COUNTDOWN: {
+            char cd[16];
+            int sec = 3 - (int)(elapsed_ms / 1000);
+            snprintf(cd, sizeof(cd), "START IN %d", sec);
+            OLED_Str(cd, 12, 0);
+            break;
+        }
         case STATE_RUNNING:  OLED_Str("RUNNING", 0, 0);          break;
         case STATE_FINISHED: OLED_Str("FINISHED!", 0, 0);        break;
         case STATE_OOB:      OLED_Str("OUT OF BOUNDS!", 0, 0);   break;
@@ -207,10 +218,10 @@ static void OLED_ShowDebug(State_t state, float error, uint16_t speed,
     OLED_Str("Gray:", 0, 4);
     OLED_Str(gbuf, 36, 4);
 
-    /* Row 6: 時間 */
+    /* Row 6: 時間 + 編碼器 */
     uint32_t sec = elapsed_ms / 1000;
     uint32_t ms  = elapsed_ms % 1000;
-    snprintf(buf, sizeof(buf), "T:%2lu.%03lu", (unsigned long)sec, (unsigned long)ms);
+    snprintf(buf, sizeof(buf), "T:%2lu.%03lu d:%+4ld", (unsigned long)sec, (unsigned long)ms, (long)g_enc_diff);
     OLED_Str(buf, 0, 6);
 
     OLED_Flush();
@@ -268,6 +279,10 @@ int main(void)
     uint32_t elapsed_ms  = 0;
     uint8_t  oob_cnt     = 0;
 
+    /* 編碼器 */
+    int32_t enc_l_prev = 0, enc_r_prev = 0;
+    uint8_t enc_inited  = 0;
+
     while (1)
     {
         /* ---- 100Hz timing ---- */
@@ -293,13 +308,12 @@ int main(void)
             }
         }
 
-        /* 按鍵觸發 */
-        uint8_t btn_rising = btn_state && !btn_prev;
+        /* 按鍵放開觸發 (falling edge) */
+        uint8_t btn_falling = !btn_state && btn_prev;
 
-        if (btn_rising && state == STATE_IDLE) {
-            state = STATE_RUNNING;
+        if (btn_falling && state == STATE_IDLE) {
+            state = STATE_COUNTDOWN;
             start_time = now;
-            elapsed_ms = 0;
             PID_Reset(&pid_pos);
         }
 
@@ -311,6 +325,27 @@ int main(void)
         case STATE_IDLE:
             Motor_Brake();
             break;
+
+        case STATE_COUNTDOWN: {
+            /* 倒數期間預讀感測器, 避免起跑 derivative kick */
+            uint8_t g = Gray_Read();
+            float e = Line_GetError(g);
+            if (e < 800.0f && e > -800.0f) {
+                PID_Compute(&pid_pos, 0.0f, e, dt);  /* 預熱 prev_error */
+            }
+
+            elapsed_ms = now - start_time;
+            if (elapsed_ms >= 3000) {
+                state = STATE_RUNNING;
+                start_time = now;
+                elapsed_ms = 0;
+                enc_l_prev = (int32_t)TIM1->CNT;
+                enc_r_prev = (int32_t)TIM8->CNT;
+                enc_inited = 1;
+            }
+            Motor_Brake();
+            break;
+        }
 
         case STATE_RUNNING: {
             elapsed_ms = now - start_time;
@@ -332,12 +367,32 @@ int main(void)
                 if (oob_cnt > 0) oob_cnt--;
             }
 
-            /* PID 計算 */
-            float steering = PID_Compute(&pid_pos, 0.0f, error, dt);
+            /* PID 計算 (脫線時直走不轉向) */
+            float steering;
+            if (error == LINE_LOST || error == LINE_FULL) {
+                steering = 0.0f;  /* 脫線：直走，不靠 PID 亂轉 */
+            } else {
+                steering = PID_Compute(&pid_pos, 0.0f, error, dt);
+            }
 
             /* 馬達輸出 */
             int16_t pwm_l = (int16_t)BASE_SPEED + (int16_t)steering;
             int16_t pwm_r = (int16_t)BASE_SPEED - (int16_t)steering;
+
+            /* 讀編碼器差值 (正值=左輪快→應右偏) */
+            if (enc_inited) {
+                int32_t enc_l = (int32_t)TIM1->CNT;
+                int32_t enc_r = (int32_t)TIM8->CNT;
+                int32_t dl = enc_l - enc_l_prev;
+                int32_t dr = enc_r - enc_r_prev;
+                enc_l_prev = enc_l;
+                enc_r_prev = enc_r;
+                g_enc_diff = dl - dr;
+            }
+
+            /* 右輪 PWM 補償 */
+            pwm_r += RIGHT_TRIM;
+
             Motor_SetSpeed(pwm_l, pwm_r);
             break;
         }
