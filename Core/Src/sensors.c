@@ -38,41 +38,42 @@ uint8_t Gray_Read(void)
     uint32_t r = PORT_GRAY->IDR;
     uint8_t gray = 0;
 
-    if (r & PIN_GRAY_CH1)  gray |= 0x01;   /* PE4  → bit 0 */
-    if (r & PIN_GRAY_CH2)  gray |= 0x02;   /* PE5  → bit 1 */
-    if (r & PIN_GRAY_CH3)  gray |= 0x04;   /* PE6  → bit 2 */
-    if (r & PIN_GRAY_CH4)  gray |= 0x08;   /* PE7  → bit 3 */
-    if (r & PIN_GRAY_CH5)  gray |= 0x10;   /* PE8  → bit 4 */
-    if (r & PIN_GRAY_CH6)  gray |= 0x20;   /* PE10 → bit 5 */
-    if (r & PIN_GRAY_CH7)  gray |= 0x40;   /* PE12 → bit 6 */
-    if (r & PIN_GRAY_CH8)  gray |= 0x80;   /* PE13 → bit 7 */
+    /* 感測器 active-LOW: 黑線=0, 白色=1, 取反 */
+    if (!(r & PIN_GRAY_CH1))  gray |= 0x01;   /* PE4  → bit 0 */
+    if (!(r & PIN_GRAY_CH2))  gray |= 0x02;   /* PE5  → bit 1 */
+    if (!(r & PIN_GRAY_CH3))  gray |= 0x04;   /* PE6  → bit 2 */
+    if (!(r & PIN_GRAY_CH4))  gray |= 0x08;   /* PE7  → bit 3 */
+    if (!(r & PIN_GRAY_CH5))  gray |= 0x10;   /* PE8  → bit 4 */
+    if (!(r & PIN_GRAY_CH6))  gray |= 0x20;   /* PE10 → bit 5 */
+    if (!(r & PIN_GRAY_CH7))  gray |= 0x40;   /* PE12 → bit 6 */
+    if (!(r & PIN_GRAY_CH8))  gray |= 0x80;   /* PE13 → bit 7 */
 
     return gray;
 }
 
 /**
-  * @brief  加權平均法計算線位置誤差
+  * @brief  邊緣檢測法計算線位置
   *
-  *   error = Σ(w_i × 1) / count  (僅計算看到黑線的通道)
+  *   取最左和最右看到黑線的感測器中點 = 線中心
+  *   解決加權平均在單/多感測器時結果不一致的問題
   *   0 = 正中, 負 = 偏左, 正 = 偏右
   */
 float Line_GetError(uint8_t gray)
 {
-    /* 全白 → 斷線 */
     if (gray == 0x00) return LINE_LOST;
-
-    /* 全黑 → 起點區或異常 */
     if (gray == 0xFF) return LINE_FULL;
 
-    int32_t w_sum = 0;
-    int32_t count = 0;
+    /* 找最左和最右的 ON 感測器 */
+    int left  = 8;   /* 初始: 最右+1 */
+    int right = -1;  /* 初始: 最左-1 */
 
     for (int i = 0; i < 8; i++) {
         if (gray & (1 << i)) {
-            w_sum += sensor_pos[i];
-            count++;
+            if (i < left)  left  = i;
+            if (i > right) right = i;
         }
     }
 
-    return (float)w_sum / (float)count;
+    /* 線中心 = 左右邊界中點 */
+    return (float)(sensor_pos[left] + sensor_pos[right]) / 2.0f;
 }

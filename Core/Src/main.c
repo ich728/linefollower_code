@@ -17,15 +17,15 @@
 /* USER CODE BEGIN PD */
 /* ======================== 控制參數 ======================== */
 #define LOOP_MS         10       /* 控制迴圈週期 (100Hz)          */
-#define BASE_SPEED      150      /* 基底速度 PWM duty (0-999)     */
+#define BASE_SPEED      200      /* 基底速度 PWM duty (0-999)     */
 #define RIGHT_TRIM      35       /* 右輪 PWM 補償 (右偏時增大)     */
 #define FAN_SPEED_US    1250     /* 風扇轉速 µs (上限)          */
 #define TARGET_DIST_MM  10000    /* 一圈總長 mm（現場調整）       */
 
 /* PID 參數 (初始值，透過 OLED + 按鍵可調) */
-#define KP_INIT         0.80f   /* P: 比例反應               */
+#define KP_INIT         4.00f   /* P: 比例反應               */
 #define KI_INIT         0.00f   /* I: 不加                    */
-#define KD_INIT         0.30f   /* D: 阻尼 (加強對慢震)       */
+#define KD_INIT         0.00f   /* D: 阻尼                    */
 #define I_LIMIT         300.0f
 #define OUTPUT_LIMIT    300.0f
 
@@ -241,9 +241,9 @@ int main(void)
     SystemClock_Config();
     MX_GPIO_Init();
 
-    /* TIM2 PWM (馬達) + TIM4 ESC (風扇) */
+    /* TIM2 PWM (馬達) */
     Motor_TIM_Init();
-    Fan_Init();
+    /* 負壓風扇：TIM4 不啟動, PB8 = GPIO OUT LOW */
 
     /* TIM1 + TIM8 Quadrature Encoder */
     RCC->APB2ENR |= RCC_APB2ENR_TIM1EN | RCC_APB2ENR_TIM8EN;
@@ -279,9 +279,11 @@ int main(void)
     uint32_t elapsed_ms  = 0;
     uint8_t  oob_cnt     = 0;
 
-    /* 編碼器 */
+    /* 編碼器 + 濾波 */
     int32_t enc_l_prev = 0, enc_r_prev = 0;
     uint8_t enc_inited  = 0;
+    float   err_hist[3] = {0, 0, 0};
+    uint8_t err_idx = 0;
 
     while (1)
     {
@@ -342,6 +344,9 @@ int main(void)
                 enc_l_prev = (int32_t)TIM1->CNT;
                 enc_r_prev = (int32_t)TIM8->CNT;
                 enc_inited = 1;
+                /* 初始化低通濾波器 */
+                err_hist[0] = err_hist[1] = err_hist[2] = 0.0f;
+                err_idx = 0;
             }
             Motor_Brake();
             break;
@@ -367,12 +372,21 @@ int main(void)
                 if (oob_cnt > 0) oob_cnt--;
             }
 
-            /* PID 計算 (脫線時直走不轉向) */
+            /* 低通濾波: 抑制單次 flicker 造成的突發轉向 */
+            err_hist[err_idx] = error;
+            err_idx = (err_idx + 1) % 3;
+            float error_f = (err_hist[0] + err_hist[1] + err_hist[2]) / 3.0f;
+
+            /* PID 計算: 大誤差→提高 KP (彎道加強) */
             float steering;
-            if (error == LINE_LOST || error == LINE_FULL) {
-                steering = 0.0f;  /* 脫線：直走，不靠 PID 亂轉 */
+            if (error_f > 800.0f || error_f < -800.0f) {
+                steering = 0.0f;
             } else {
-                steering = PID_Compute(&pid_pos, 0.0f, error, dt);
+                float e_abs = (error_f > 0) ? error_f : -error_f;
+                float saved_kp = pid_pos.Kp;
+                if (e_abs > 10.0f) pid_pos.Kp = KP_INIT * 3.0f;
+                steering = PID_Compute(&pid_pos, 0.0f, error_f, dt);
+                pid_pos.Kp = saved_kp;
             }
 
             /* 馬達輸出 */
@@ -471,11 +485,11 @@ static void MX_GPIO_Init(void)
     HAL_GPIO_Init(PORT_MOTOR, &g);
 
     /* ---- PORTB: 控制 ---- */
-    /* ESC_PWM (PB8) — TIM4_CH3, AF2 */
+    /* ESC_PWM (PB8) — GPIO OUT LOW (負壓風扇禁用) */
     g.Pin       = PIN_ESC;
-    g.Mode      = GPIO_MODE_AF_PP;
+    g.Mode      = GPIO_MODE_OUTPUT_PP;
     g.Pull      = GPIO_NOPULL;
-    g.Alternate = GPIO_AF2_TIM4;
+    g.Alternate = 0;
     HAL_GPIO_Init(PORT_ESC_FAN, &g);
 
     /* ESC_DIR (PB1) */
