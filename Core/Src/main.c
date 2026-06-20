@@ -34,9 +34,12 @@
 
 /* 出界判定閾值 */
 #define OOB_ERROR_MM    40.0f    /* 線誤差超過此值視為偏離       */
-#define LINE_LOST_GRACE_COUNT 36 /* 约 180ms 沿最后方向寻找黑线    */
-#define LINE_LOST_SPEED       90 /* 失线期间低速，避免冲出赛道     */
-#define LINE_LOST_STEER_GAIN 0.75f
+#define LINE_LOST_GRACE_COUNT 64 /* 约 320ms 沿最后方向寻找黑线    */
+#define LINE_LOST_SPEED       70 /* 急弯失线期间更低速搜索         */
+#define LINE_LOST_STEER_GAIN 1.00f
+#define SHARP_TURN_ERROR_MM  30.0f
+#define SHARP_TURN_GAIN       1.25f
+#define SHARP_TURN_LIMIT    175.0f
 
 /* ======================== 狀態機 ======================== */
 typedef enum {
@@ -513,6 +516,18 @@ int main(void)
                 steering = 0.0f;
             } else {
                 steering = PID_Compute(&pid_pos, 0.0f, error, dt);
+                /*
+                 * 黑线进入外侧感测器时视为急弯。只在边缘区域增加转向，
+                 * 避免改变直线与普通弯道的手感。
+                 */
+                if (e_abs >= SHARP_TURN_ERROR_MM) {
+                    steering *= SHARP_TURN_GAIN;
+                    if (steering > SHARP_TURN_LIMIT) {
+                        steering = SHARP_TURN_LIMIT;
+                    } else if (steering < -SHARP_TURN_LIMIT) {
+                        steering = -SHARP_TURN_LIMIT;
+                    }
+                }
                 last_valid_steering = steering;
             }
 
