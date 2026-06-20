@@ -40,6 +40,13 @@
 #define SHARP_TURN_ERROR_MM  30.0f
 #define SHARP_TURN_GAIN       1.25f
 #define SHARP_TURN_LIMIT    175.0f
+#define SENSOR_LEFT_HALF_MASK   0x0FU /* CH1-CH4 */
+#define SENSOR_RIGHT_HALF_MASK  0xF0U /* CH5-CH8 */
+#define SENSOR_CENTER_MASK      0x18U /* CH4-CH5 */
+#define ZIGZAG_SPEED             125
+#define ZIGZAG_STEERING        115.0f
+#define ZIGZAG_MAX_COUNT         80U  /* 单次强制急转最多约 400ms */
+#define ZIGZAG_MIN_COUNT          6U  /* 至少保持约 30ms */
 
 /* ======================== 狀態機 ======================== */
 typedef enum {
@@ -411,6 +418,8 @@ int main(void)
     uint32_t elapsed_ms  = 0;
     uint8_t  line_lost_cnt = 0;
     float last_valid_steering = 0.0f;
+    int8_t zigzag_dir = 0;       /* -1=左急转, +1=右急转 */
+    uint8_t zigzag_count = 0;
 
     /* 編碼器 */
     int32_t enc_l_prev = 0, enc_r_prev = 0;
@@ -449,6 +458,8 @@ int main(void)
             PID_Reset(&pid_pos);
             line_lost_cnt = 0;
             last_valid_steering = 0.0f;
+            zigzag_dir = 0;
+            zigzag_count = 0;
         }
 
         btn_prev = btn_state;
@@ -486,10 +497,57 @@ int main(void)
             float   error = Line_GetError(gray);
 
             /*
+             * 锯齿路段特征：
+             *   右半 CH5-CH8 全黑且左半未全黑 -> 强制右转
+             *   左半 CH1-CH4 全黑且右半未全黑 -> 强制左转
+             * 全黑 0xFF 不触发，避免把起终点标记误判为锯齿。
+             */
+            uint8_t left_half_black =
+                (gray & SENSOR_LEFT_HALF_MASK) == SENSOR_LEFT_HALF_MASK;
+            uint8_t right_half_black =
+                (gray & SENSOR_RIGHT_HALF_MASK) == SENSOR_RIGHT_HALF_MASK;
+
+            if (right_half_black && !left_half_black) {
+                if (zigzag_dir != 1) {
+                    zigzag_dir = 1;
+                    zigzag_count = 0;
+                }
+            } else if (left_half_black && !right_half_black) {
+                if (zigzag_dir != -1) {
+                    zigzag_dir = -1;
+                    zigzag_count = 0;
+                }
+            }
+
+            if (zigzag_dir != 0) {
+                if (zigzag_count < ZIGZAG_MAX_COUNT) zigzag_count++;
+
+                /*
+                 * 强制转向后，中央重新捕获窄线且半区全黑特征消失，
+                 * 才交还给普通 PD。下一折若出现相反半区全黑，会直接
+                 * 切换方向。
+                 */
+                uint8_t normal_center_reacquired =
+                    (gray & SENSOR_CENTER_MASK) != 0U &&
+                    !left_half_black && !right_half_black &&
+                    error > -18.0f && error < 18.0f;
+
+                if ((zigzag_count >= ZIGZAG_MIN_COUNT &&
+                     normal_center_reacquired) ||
+                    zigzag_count >= ZIGZAG_MAX_COUNT) {
+                    zigzag_dir = 0;
+                    zigzag_count = 0;
+                    if (error != LINE_LOST && error != LINE_FULL) {
+                        pid_pos.prev_error = -error;
+                    }
+                }
+            }
+
+            /*
              * 感测器靠近车轮，弯道中可能短暂全白。此时沿用最后有效
              * 转向并降速寻找黑线；持续约 180ms 仍未找回才停车。
              */
-            if (error == LINE_LOST) {
+            if (error == LINE_LOST && zigzag_dir == 0) {
                 if (line_lost_cnt < LINE_LOST_GRACE_COUNT) line_lost_cnt++;
                 if (line_lost_cnt >= LINE_LOST_GRACE_COUNT) {
                     Motor_SetPWM(0, 0);
@@ -510,7 +568,11 @@ int main(void)
             float steering = 0.0f;
             float e_abs = (error > 0) ? error : -error;
 
-            if (error == LINE_LOST) {
+            if (zigzag_dir > 0) {
+                steering = -ZIGZAG_STEERING;
+            } else if (zigzag_dir < 0) {
+                steering = ZIGZAG_STEERING;
+            } else if (error == LINE_LOST) {
                 steering = last_valid_steering * LINE_LOST_STEER_GAIN;
             } else if (error == LINE_FULL) {
                 steering = 0.0f;
@@ -535,7 +597,11 @@ int main(void)
             float ratio = 1.0f - e_abs * 0.014f;
             if (ratio < 0.35f) ratio = 0.35f;
             uint16_t cur_speed = (uint16_t)((float)FIXED_SPEED * ratio);
-            if (error == LINE_LOST) cur_speed = LINE_LOST_SPEED;
+            if (zigzag_dir != 0) {
+                cur_speed = ZIGZAG_SPEED;
+            } else if (error == LINE_LOST) {
+                cur_speed = LINE_LOST_SPEED;
+            }
 
             /* 馬達輸出 */
             int16_t pwm_l = (int16_t)cur_speed - (int16_t)steering;
