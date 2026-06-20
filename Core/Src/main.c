@@ -17,6 +17,7 @@
 /* USER CODE BEGIN PD */
 /* ======================== 控制參數 ======================== */
 #define LOOP_MS         5        /* 控制迴圈週期 (200Hz)          */
+#define DISTANCE_UART_DIAGNOSTIC_MODE 0
 #define MOTOR_DIAGNOSTIC_MODE 0  /* 1=低速左右輪/編碼器診斷       */
 #define OLED_ENABLED         0  /* 實機未安裝 OLED，禁止阻塞刷新   */
 #define ESC_DIAGNOSTIC_MODE  0  /* 禁止開機按住按鍵進入隱藏模式   */
@@ -53,6 +54,26 @@
 #define GAP_MAX_COUNT             200U /* 最多约 1 秒 */
 
 /* ======================== 狀態機 ======================== */
+/* SDM02 obstacle avoidance parameters (first hardware-test version). */
+#define OBSTACLE_TRIGGER_MM        270U
+#define OBSTACLE_CLEAR_MM          350U
+#define OBSTACLE_CONFIRM_FRAMES      2U
+#define OBSTACLE_FRAME_TIMEOUT_MS   120U
+#define OBSTACLE_PWM                205
+#define OBSTACLE_RETURN_PIVOT_PWM   170
+#define OBSTACLE_ALIGN_PWM          145
+#define OBSTACLE_INNER_PWM            0
+#define OBSTACLE_STRAIGHT_PWM       215
+#define OBSTACLE_BRAKE_MS             0U
+#define OBSTACLE_PIVOT_MS           255U
+#define OBSTACLE_SIDE_MS            300U
+#define OBSTACLE_PASS_MS            620U
+#define OBSTACLE_LINE_CONFIRM         2U
+#define OBSTACLE_SEEK_TIMEOUT_MS    600U
+#define OBSTACLE_ALIGN_MIN_MS         90U
+#define OBSTACLE_ALIGN_MAX_MS        650U
+#define OBSTACLE_SETTLE_MS           50U
+
 typedef enum {
     STATE_IDLE,          /* 等待按鍵啟動                        */
     STATE_COUNTDOWN,     /* 倒數 3 秒後啟動                     */
@@ -60,6 +81,20 @@ typedef enum {
     STATE_FINISHED,      /* 完成一圈                            */
     STATE_OOB            /* 出界                                */
 } State_t;
+
+typedef enum {
+    OBS_IDLE = 0,
+    OBS_BRAKE,
+    OBS_TURN_OUT,
+    OBS_MOVE_SIDE,
+    OBS_TURN_PARALLEL,
+    OBS_PASS_BLOCK,
+    OBS_TURN_TO_LINE,
+    OBS_SEEK_LINE,
+    OBS_ALIGN_TRACK,
+    OBS_SETTLE,
+    OBS_FAILED
+} ObstacleState_t;
 
 /* ======================== OLED 5×8 字型 ======================== */
 static const uint8_t font5x8[91][5] = {
@@ -115,6 +150,309 @@ static const uint8_t font5x8[91][5] = {
 /* USER CODE BEGIN 0 */
 static int32_t  g_enc_diff;    /* 編碼器差值 */
 static float    g_steering;     /* PID 輸出供 OLED */
+
+volatile uint32_t distance_diag_magic = 0x53444D32U; /* "SDM2" */
+volatile uint32_t distance_diag_count;
+volatile uint32_t distance_diag_errors;
+volatile uint32_t distance_diag_valid_frames;
+volatile uint32_t distance_diag_checksum_errors;
+volatile uint16_t distance_diag_mm = 0xFFFFU;
+volatile uint32_t distance_diag_last_tick;
+volatile uint8_t distance_diag_raw[32];
+
+static volatile uint8_t distance_frame[4];
+static volatile uint8_t distance_frame_index;
+static uint32_t distance_last_restart_tick;
+
+static ObstacleState_t obstacle_state = OBS_IDLE;
+static uint32_t obstacle_phase_start;
+static uint32_t obstacle_last_frame;
+static uint8_t obstacle_confirm_count;
+static uint8_t obstacle_line_count;
+static uint8_t obstacle_completed;
+static uint8_t obstacle_just_completed;
+
+static void Distance_UART1_SendStart(void)
+{
+    static const uint8_t start_measurement[] =
+        {0x5A, 0x0A, 0x02, 0x02, 0x00, 0xF1};
+
+    for (uint32_t i = 0; i < sizeof(start_measurement); i++) {
+        while (!(USART1->SR & USART_SR_TXE)) {}
+        USART1->DR = start_measurement[i];
+    }
+    while (!(USART1->SR & USART_SR_TC)) {}
+    distance_last_restart_tick = HAL_GetTick();
+}
+
+static void Distance_UART1_Init(void)
+{
+    /* PA9=USART1_TX, PA10=USART1_RX, AF7. */
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+    RCC->APB2ENR |= RCC_APB2ENR_USART1EN;
+    (void)RCC->APB2ENR;
+
+    GPIOA->MODER &= ~((3U << (9U * 2U)) | (3U << (10U * 2U)));
+    GPIOA->MODER |=  ((2U << (9U * 2U)) | (2U << (10U * 2U)));
+    GPIOA->AFR[1] &= ~((0xFU << 4U) | (0xFU << 8U));
+    GPIOA->AFR[1] |=  ((7U << 4U) | (7U << 8U));
+    GPIOA->PUPDR &= ~((3U << (9U * 2U)) | (3U << (10U * 2U)));
+    GPIOA->PUPDR |=  (1U << (10U * 2U)); /* RX pull-up */
+    GPIOA->OSPEEDR |= (3U << (9U * 2U)) | (3U << (10U * 2U));
+
+    USART1->CR1 = 0;
+    USART1->CR2 = 0;
+    USART1->CR3 = 0;
+    /* PCLK2=16MHz, 115200 baud, oversampling by 16: BRR ≈ 0x008B. */
+    USART1->BRR = 0x008BU;
+    USART1->CR1 = USART_CR1_RE | USART_CR1_TE | USART_CR1_UE;
+
+    distance_diag_count = 0;
+    distance_diag_errors = 0;
+    distance_diag_valid_frames = 0;
+    distance_diag_checksum_errors = 0;
+    distance_diag_mm = 0xFFFFU;
+    distance_diag_last_tick = 0;
+    distance_frame_index = 0;
+    distance_last_restart_tick = 0;
+
+    HAL_Delay(300);
+    Distance_UART1_SendStart();
+    HAL_Delay(20);
+
+    /* Clear a possible command echo before enabling continuous RX IRQ. */
+    while (USART1->SR & USART_SR_RXNE) {
+        (void)USART1->DR;
+    }
+    USART1->CR1 |= USART_CR1_RXNEIE;
+    HAL_NVIC_SetPriority(USART1_IRQn, 2, 0);
+    HAL_NVIC_EnableIRQ(USART1_IRQn);
+}
+
+static void Distance_UART1_Service(uint32_t now)
+{
+    uint8_t stale = (distance_diag_last_tick == 0U) ||
+                    ((now - distance_diag_last_tick) > 500U);
+    if (stale && (now - distance_last_restart_tick) >= 500U) {
+        Distance_UART1_SendStart();
+    }
+}
+
+void USART1_IRQHandler(void)
+{
+    uint32_t sr = USART1->SR;
+    if (sr & (USART_SR_ORE | USART_SR_NE | USART_SR_FE | USART_SR_PE)) {
+        distance_diag_errors++;
+        (void)USART1->DR;
+        distance_frame_index = 0;
+        return;
+    }
+
+    if (sr & USART_SR_RXNE) {
+        uint8_t value = (uint8_t)USART1->DR;
+        uint32_t raw_index = distance_diag_count++;
+        if (raw_index < sizeof(distance_diag_raw)) {
+            distance_diag_raw[raw_index] = value;
+        }
+
+        if (distance_frame_index == 0U) {
+            if (value == 0x5CU) {
+                distance_frame[0] = value;
+                distance_frame_index = 1U;
+            }
+        } else {
+            distance_frame[distance_frame_index++] = value;
+            if (distance_frame_index == 4U) {
+                uint8_t checksum = (uint8_t)~(
+                    (uint8_t)(distance_frame[1] + distance_frame[2]));
+                if (distance_frame[3] == checksum) {
+                    distance_diag_mm =
+                        (uint16_t)distance_frame[1] |
+                        ((uint16_t)distance_frame[2] << 8U);
+                    distance_diag_valid_frames++;
+                    distance_diag_last_tick = HAL_GetTick();
+                } else {
+                    distance_diag_checksum_errors++;
+                }
+                distance_frame_index = 0U;
+            }
+        }
+    }
+}
+
+static void Obstacle_Reset(void)
+{
+    obstacle_state = OBS_IDLE;
+    obstacle_phase_start = 0;
+    obstacle_last_frame = distance_diag_valid_frames;
+    obstacle_confirm_count = 0;
+    obstacle_line_count = 0;
+    obstacle_completed = 0;
+    obstacle_just_completed = 0;
+}
+
+static uint8_t Obstacle_Update(uint32_t now, uint8_t gray)
+{
+    uint32_t valid_frames = distance_diag_valid_frames;
+    uint16_t distance_mm = distance_diag_mm;
+    uint8_t distance_fresh =
+        (now - distance_diag_last_tick) <= OBSTACLE_FRAME_TIMEOUT_MS;
+
+    if (obstacle_state == OBS_IDLE) {
+        if (!obstacle_completed && valid_frames != obstacle_last_frame) {
+            obstacle_last_frame = valid_frames;
+            if (distance_fresh && distance_mm >= 30U &&
+                distance_mm <= OBSTACLE_TRIGGER_MM) {
+                if (obstacle_confirm_count < OBSTACLE_CONFIRM_FRAMES) {
+                    obstacle_confirm_count++;
+                }
+            } else {
+                obstacle_confirm_count = 0;
+            }
+
+            if (obstacle_confirm_count >= OBSTACLE_CONFIRM_FRAMES) {
+                obstacle_state = OBS_BRAKE;
+                obstacle_phase_start = now;
+                obstacle_line_count = 0;
+            }
+        }
+        return 0;
+    }
+
+    uint32_t phase_ms = now - obstacle_phase_start;
+    switch (obstacle_state) {
+    case OBS_BRAKE:
+        Motor_SetSpeed(OBSTACLE_PWM, -OBSTACLE_PWM);
+        if (phase_ms >= OBSTACLE_BRAKE_MS) {
+            obstacle_state = OBS_TURN_OUT;
+            obstacle_phase_start = now;
+        }
+        break;
+
+    case OBS_TURN_OUT:
+        /* Pivot right by approximately 90 degrees. */
+        Motor_SetSpeed(OBSTACLE_PWM, -OBSTACLE_PWM);
+        if (phase_ms >= OBSTACLE_PIVOT_MS) {
+            obstacle_state = OBS_MOVE_SIDE;
+            obstacle_phase_start = now;
+        }
+        break;
+
+    case OBS_MOVE_SIDE:
+        Motor_SetSpeed(OBSTACLE_STRAIGHT_PWM,
+                       OBSTACLE_STRAIGHT_PWM + RIGHT_TRIM);
+        if (phase_ms >= OBSTACLE_SIDE_MS) {
+            obstacle_state = OBS_TURN_PARALLEL;
+            obstacle_phase_start = now;
+        }
+        break;
+
+    case OBS_TURN_PARALLEL:
+        /* Pivot left to become parallel with the track. */
+        Motor_SetSpeed(-OBSTACLE_PWM, OBSTACLE_PWM);
+        if (phase_ms >= OBSTACLE_PIVOT_MS) {
+            obstacle_state = OBS_PASS_BLOCK;
+            obstacle_phase_start = now;
+        }
+        break;
+
+    case OBS_PASS_BLOCK:
+        Motor_SetSpeed(OBSTACLE_STRAIGHT_PWM,
+                       OBSTACLE_STRAIGHT_PWM + RIGHT_TRIM);
+        if (phase_ms >= OBSTACLE_PASS_MS) {
+            obstacle_state = OBS_TURN_TO_LINE;
+            obstacle_phase_start = now;
+        }
+        break;
+
+    case OBS_TURN_TO_LINE:
+        /* Pivot left, then the next straight segment searches for the line. */
+        Motor_SetSpeed(-OBSTACLE_RETURN_PIVOT_PWM,
+                       OBSTACLE_RETURN_PIVOT_PWM);
+        if (phase_ms >= OBSTACLE_PIVOT_MS) {
+            obstacle_state = OBS_SEEK_LINE;
+            obstacle_phase_start = now;
+            obstacle_line_count = 0;
+        }
+        break;
+
+    case OBS_SEEK_LINE:
+        Motor_SetSpeed(OBSTACLE_STRAIGHT_PWM,
+                       OBSTACLE_STRAIGHT_PWM + RIGHT_TRIM);
+        if (gray != 0U) {
+            if (obstacle_line_count < OBSTACLE_LINE_CONFIRM) {
+                obstacle_line_count++;
+            }
+        } else {
+            obstacle_line_count = 0;
+        }
+        if (obstacle_line_count >= OBSTACLE_LINE_CONFIRM) {
+            obstacle_state = OBS_ALIGN_TRACK;
+            obstacle_phase_start = now;
+            obstacle_line_count = 0;
+        } else if (phase_ms >= OBSTACLE_SEEK_TIMEOUT_MS) {
+            obstacle_state = OBS_FAILED;
+        }
+        break;
+
+    case OBS_ALIGN_TRACK:
+        /*
+         * Pivot right until the track reaches the middle sensors.  The line
+         * is first reacquired by an edge sensor, so a fixed turn often exits
+         * before the chassis is actually aligned.
+         */
+        Motor_SetSpeed(OBSTACLE_ALIGN_PWM, -OBSTACLE_ALIGN_PWM);
+        if (phase_ms >= OBSTACLE_ALIGN_MIN_MS &&
+            (gray & SENSOR_CENTER_MASK) != 0U) {
+            if (obstacle_line_count < OBSTACLE_LINE_CONFIRM) {
+                obstacle_line_count++;
+            }
+        } else {
+            obstacle_line_count = 0;
+        }
+
+        if (obstacle_line_count >= OBSTACLE_LINE_CONFIRM) {
+            obstacle_state = OBS_SETTLE;
+            obstacle_phase_start = now;
+        } else if (phase_ms >= OBSTACLE_ALIGN_MAX_MS) {
+            /*
+             * If any sensor still sees the track, hand over gently instead
+             * of stopping on top of the line.  Stop only when truly lost.
+             */
+            if (gray != 0U) {
+                obstacle_state = OBS_SETTLE;
+                obstacle_phase_start = now;
+            } else {
+                obstacle_state = OBS_FAILED;
+            }
+        }
+        break;
+
+    case OBS_SETTLE:
+        /* Remove pivot inertia before handing control back to line PID. */
+        Motor_SetPWM(0, 0);
+        Motor_Brake();
+        if (phase_ms >= OBSTACLE_SETTLE_MS) {
+            obstacle_state = OBS_IDLE;
+            obstacle_completed = 1U;
+            obstacle_just_completed = 1U;
+            obstacle_confirm_count = 0;
+            return 0;
+        }
+        break;
+
+    case OBS_FAILED:
+        Motor_SetPWM(0, 0);
+        Motor_Brake();
+        break;
+
+    default:
+        obstacle_state = OBS_FAILED;
+        break;
+    }
+
+    return 1;
+}
 
 /* ======================== OLED (SPI2, PD3-6) ======================== */
 static uint8_t oled_buf[128][8];
@@ -336,6 +674,9 @@ int main(void)
     /* 馬達初始化 */
     Motor_Init();
 
+    Distance_UART1_Init();
+    Obstacle_Reset();
+
 #if MOTOR_DIAGNOSTIC_MODE && OLED_ENABLED
     OLED_Init();
     Motor_Diagnostic_Run();
@@ -437,6 +778,7 @@ int main(void)
     {
         /* ---- 100Hz timing ---- */
         uint32_t now = HAL_GetTick();
+        Distance_UART1_Service(now);
         if (now - last_loop < LOOP_MS) continue;
         float dt = (float)(now - last_loop) / 1000.0f;
         last_loop = now;
@@ -473,6 +815,7 @@ int main(void)
             gap_count = 0;
             gap_encoder_counts = 0;
             last_valid_error = 0.0f;
+            Obstacle_Reset();
             enc_l_prev = (uint16_t)TIM1->CNT;
             enc_r_prev = (uint16_t)TIM8->CNT;
         }
@@ -522,6 +865,30 @@ int main(void)
                 (uint32_t)((enc_l_delta < 0) ? -enc_l_delta : enc_l_delta);
             uint32_t enc_r_abs =
                 (uint32_t)((enc_r_delta < 0) ? -enc_r_delta : enc_r_delta);
+
+            /*
+             * Obstacle controller owns the motors while bypassing the brick.
+             * Normal line-loss/zigzag logic is intentionally suspended.
+             */
+            if (Obstacle_Update(now, gray)) {
+                if (obstacle_state == OBS_FAILED) {
+                    PID_Reset(&pid_pos);
+                    g_steering = 0.0f;
+                    state = STATE_OOB;
+                }
+                break;
+            }
+
+            if (obstacle_just_completed) {
+                obstacle_just_completed = 0;
+                PID_Reset(&pid_pos);
+                line_lost_cnt = 0;
+                zigzag_dir = 0;
+                zigzag_count = 0;
+                gap_mode = 0;
+                gap_count = 0;
+                gap_encoder_counts = 0;
+            }
 
             /*
              * 锯齿路段特征：
