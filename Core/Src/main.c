@@ -34,7 +34,9 @@
 
 /* 出界判定閾值 */
 #define OOB_ERROR_MM    40.0f    /* 線誤差超過此值視為偏離       */
-#define OOB_COUNT_MAX   6        /* 連續 6 次 (約 30ms) 觸發停車 */
+#define LINE_LOST_GRACE_COUNT 36 /* 约 180ms 沿最后方向寻找黑线    */
+#define LINE_LOST_SPEED       90 /* 失线期间低速，避免冲出赛道     */
+#define LINE_LOST_STEER_GAIN 0.75f
 
 /* ======================== 狀態機 ======================== */
 typedef enum {
@@ -404,7 +406,8 @@ int main(void)
     uint32_t last_loop   = HAL_GetTick();
     uint32_t start_time  = 0;
     uint32_t elapsed_ms  = 0;
-    uint8_t  oob_cnt     = 0;
+    uint8_t  line_lost_cnt = 0;
+    float last_valid_steering = 0.0f;
 
     /* 編碼器 */
     int32_t enc_l_prev = 0, enc_r_prev = 0;
@@ -441,6 +444,8 @@ int main(void)
             state = STATE_COUNTDOWN;
             start_time = now;
             PID_Reset(&pid_pos);
+            line_lost_cnt = 0;
+            last_valid_steering = 0.0f;
         }
 
         btn_prev = btn_state;
@@ -478,12 +483,12 @@ int main(void)
             float   error = Line_GetError(gray);
 
             /*
-             * 连续全白代表车辆已经脱离黑线。短暂一两帧可能只是传感器
-             * 间隙，因此累计约 30ms 后才停车。
+             * 感测器靠近车轮，弯道中可能短暂全白。此时沿用最后有效
+             * 转向并降速寻找黑线；持续约 180ms 仍未找回才停车。
              */
             if (error == LINE_LOST) {
-                if (oob_cnt < OOB_COUNT_MAX) oob_cnt++;
-                if (oob_cnt >= OOB_COUNT_MAX) {
+                if (line_lost_cnt < LINE_LOST_GRACE_COUNT) line_lost_cnt++;
+                if (line_lost_cnt >= LINE_LOST_GRACE_COUNT) {
                     Motor_SetPWM(0, 0);
                     Motor_Brake();
                     PID_Reset(&pid_pos);
@@ -492,23 +497,30 @@ int main(void)
                     break;
                 }
             } else {
-                oob_cnt = 0;
+                if (line_lost_cnt > 0 && error != LINE_FULL) {
+                    /* 重新捕获黑线时同步 D 项，避免瞬时反向冲击。 */
+                    pid_pos.prev_error = -error;
+                }
+                line_lost_cnt = 0;
             }
 
-            /* PD：全黑区不进行转向，避免通过标志线时误打方向。 */
             float steering = 0.0f;
             float e_abs = (error > 0) ? error : -error;
 
-            if (error == LINE_LOST || error == LINE_FULL) {
+            if (error == LINE_LOST) {
+                steering = last_valid_steering * LINE_LOST_STEER_GAIN;
+            } else if (error == LINE_FULL) {
                 steering = 0.0f;
             } else {
                 steering = PID_Compute(&pid_pos, 0.0f, error, dt);
+                last_valid_steering = steering;
             }
 
             /* 速度曲線: 陡降, 大彎更慢 = 更多修正時間 */
             float ratio = 1.0f - e_abs * 0.014f;
             if (ratio < 0.35f) ratio = 0.35f;
             uint16_t cur_speed = (uint16_t)((float)FIXED_SPEED * ratio);
+            if (error == LINE_LOST) cur_speed = LINE_LOST_SPEED;
 
             /* 馬達輸出 */
             int16_t pwm_l = (int16_t)cur_speed - (int16_t)steering;
