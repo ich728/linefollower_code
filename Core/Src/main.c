@@ -47,6 +47,10 @@
 #define ZIGZAG_STEERING        115.0f
 #define ZIGZAG_MAX_COUNT         80U  /* 单次强制急转最多约 400ms */
 #define ZIGZAG_MIN_COUNT          6U  /* 至少保持约 30ms */
+#define GAP_ENTRY_ERROR_MM       12.0f /* 接近中心时全白判为直线断线 */
+#define GAP_CROSS_SPEED           180
+#define GAP_MAX_ENCODER_COUNTS  24000U /* 双轮平均计数安全上限 */
+#define GAP_MAX_COUNT             200U /* 最多约 1 秒 */
 
 /* ======================== 狀態機 ======================== */
 typedef enum {
@@ -420,9 +424,14 @@ int main(void)
     float last_valid_steering = 0.0f;
     int8_t zigzag_dir = 0;       /* -1=左急转, +1=右急转 */
     uint8_t zigzag_count = 0;
+    uint8_t gap_mode = 0;
+    uint16_t gap_count = 0;
+    uint32_t gap_encoder_counts = 0;
+    float last_valid_error = 0.0f;
 
     /* 編碼器 */
-    int32_t enc_l_prev = 0, enc_r_prev = 0;
+    uint16_t enc_l_prev = (uint16_t)TIM1->CNT;
+    uint16_t enc_r_prev = (uint16_t)TIM8->CNT;
 
     while (1)
     {
@@ -460,6 +469,12 @@ int main(void)
             last_valid_steering = 0.0f;
             zigzag_dir = 0;
             zigzag_count = 0;
+            gap_mode = 0;
+            gap_count = 0;
+            gap_encoder_counts = 0;
+            last_valid_error = 0.0f;
+            enc_l_prev = (uint16_t)TIM1->CNT;
+            enc_r_prev = (uint16_t)TIM8->CNT;
         }
 
         btn_prev = btn_state;
@@ -495,6 +510,18 @@ int main(void)
             /* 讀取灰階 → 加權平均 → error */
             uint8_t gray = Gray_Read();
             float   error = Line_GetError(gray);
+
+            /* 每周期读取双编码器增量，int16 转换可处理 16-bit 回绕。 */
+            uint16_t enc_l_now = (uint16_t)TIM1->CNT;
+            uint16_t enc_r_now = (uint16_t)TIM8->CNT;
+            int16_t enc_l_delta = (int16_t)(enc_l_now - enc_l_prev);
+            int16_t enc_r_delta = (int16_t)(enc_r_now - enc_r_prev);
+            enc_l_prev = enc_l_now;
+            enc_r_prev = enc_r_now;
+            uint32_t enc_l_abs =
+                (uint32_t)((enc_l_delta < 0) ? -enc_l_delta : enc_l_delta);
+            uint32_t enc_r_abs =
+                (uint32_t)((enc_r_delta < 0) ? -enc_r_delta : enc_r_delta);
 
             /*
              * 锯齿路段特征：
@@ -544,10 +571,48 @@ int main(void)
             }
 
             /*
+             * 赛规直线断线：进入全白前，黑线必须在中央附近且不处于
+             * 锯齿模式。断线期间固定直行，并以双轮平均编码器计数和
+             * 1 秒超时作为双重安全限制。
+             */
+            if (error == LINE_LOST && zigzag_dir == 0 && !gap_mode) {
+                float last_error_abs =
+                    (last_valid_error >= 0.0f)
+                    ? last_valid_error : -last_valid_error;
+                if (last_error_abs <= GAP_ENTRY_ERROR_MM) {
+                    gap_mode = 1;
+                    gap_count = 0;
+                    gap_encoder_counts = 0;
+                    PID_Reset(&pid_pos);
+                }
+            }
+
+            if (gap_mode) {
+                if (error != LINE_LOST && error != LINE_FULL) {
+                    gap_mode = 0;
+                    gap_count = 0;
+                    gap_encoder_counts = 0;
+                    pid_pos.prev_error = -error;
+                } else {
+                    if (gap_count < GAP_MAX_COUNT) gap_count++;
+                    gap_encoder_counts += (enc_l_abs + enc_r_abs) / 2U;
+                    if (gap_count >= GAP_MAX_COUNT ||
+                        gap_encoder_counts >= GAP_MAX_ENCODER_COUNTS) {
+                        Motor_SetPWM(0, 0);
+                        Motor_Brake();
+                        PID_Reset(&pid_pos);
+                        g_steering = 0.0f;
+                        state = STATE_OOB;
+                        break;
+                    }
+                }
+            }
+
+            /*
              * 感测器靠近车轮，弯道中可能短暂全白。此时沿用最后有效
              * 转向并降速寻找黑线；持续约 180ms 仍未找回才停车。
              */
-            if (error == LINE_LOST && zigzag_dir == 0) {
+            if (error == LINE_LOST && zigzag_dir == 0 && !gap_mode) {
                 if (line_lost_cnt < LINE_LOST_GRACE_COUNT) line_lost_cnt++;
                 if (line_lost_cnt >= LINE_LOST_GRACE_COUNT) {
                     Motor_SetPWM(0, 0);
@@ -568,7 +633,9 @@ int main(void)
             float steering = 0.0f;
             float e_abs = (error > 0) ? error : -error;
 
-            if (zigzag_dir > 0) {
+            if (gap_mode) {
+                steering = 0.0f;
+            } else if (zigzag_dir > 0) {
                 steering = -ZIGZAG_STEERING;
             } else if (zigzag_dir < 0) {
                 steering = ZIGZAG_STEERING;
@@ -591,13 +658,16 @@ int main(void)
                     }
                 }
                 last_valid_steering = steering;
+                last_valid_error = error;
             }
 
             /* 速度曲線: 陡降, 大彎更慢 = 更多修正時間 */
             float ratio = 1.0f - e_abs * 0.014f;
             if (ratio < 0.35f) ratio = 0.35f;
             uint16_t cur_speed = (uint16_t)((float)FIXED_SPEED * ratio);
-            if (zigzag_dir != 0) {
+            if (gap_mode) {
+                cur_speed = GAP_CROSS_SPEED;
+            } else if (zigzag_dir != 0) {
                 cur_speed = ZIGZAG_SPEED;
             } else if (error == LINE_LOST) {
                 cur_speed = LINE_LOST_SPEED;
