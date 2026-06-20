@@ -16,18 +16,16 @@
 
 /* USER CODE BEGIN PD */
 /* ======================== 控制參數 ======================== */
-#define LOOP_MS         10       /* 控制迴圈週期 (100Hz)          */
-#define BASE_SPEED      200      /* 基底速度 PWM duty (0-999)     */
-#define RIGHT_TRIM      35       /* 右輪 PWM 補償 (右偏時增大)     */
-#define FAN_SPEED_US    1250     /* 風扇轉速 µs (上限)          */
-#define TARGET_DIST_MM  10000    /* 一圈總長 mm（現場調整）       */
+#define LOOP_MS         5        /* 控制迴圈週期 (200Hz)          */
+#define FIXED_SPEED     200      /* 降速以減弱慣性                 */
+#define RIGHT_TRIM      25       /* 右輪 PWM 補償                  */
 
-/* PID 參數 (初始值，透過 OLED + 按鍵可調) */
-#define KP_INIT         4.00f   /* P: 比例反應               */
-#define KI_INIT         0.00f   /* I: 不加                    */
-#define KD_INIT         0.00f   /* D: 阻尼                    */
-#define I_LIMIT         300.0f
-#define OUTPUT_LIMIT    300.0f
+/* PID */
+#define KP_INIT         0.80f    /* P: 彎道靈敏                   */
+#define KI_INIT         0.00f    /* I: 不加                       */
+#define KD_INIT         0.12f    /* D: dt減半, KD同步降            */
+#define I_LIMIT         100.0f
+#define OUTPUT_LIMIT    400.0f
 
 /* 出界判定閾值 */
 #define OOB_ERROR_MM    40.0f    /* 線誤差超過此值視為偏離       */
@@ -94,7 +92,8 @@ static const uint8_t font5x8[91][5] = {
 /* USER CODE END PD */
 
 /* USER CODE BEGIN 0 */
-static int32_t g_enc_diff;  /* 編碼器差值供 OLED 顯示 */
+static int32_t  g_enc_diff;    /* 編碼器差值 */
+static float    g_steering;     /* PID 輸出供 OLED */
 
 /* ======================== OLED (SPI2, PD3-6) ======================== */
 static uint8_t oled_buf[128][8];
@@ -196,18 +195,10 @@ static void OLED_ShowDebug(State_t state, float error, uint16_t speed,
         case STATE_OOB:      OLED_Str("OUT OF BOUNDS!", 0, 0);   break;
     }
 
-    /* Row 2: 誤差 (整數顯示, 避免 nano.specs 不支援 float printf) */
+    /* Row 2: steering + speed */
     char buf[24];
-    if (error > 800.0f) {
-        snprintf(buf, sizeof(buf), "Line: LOST");
-    } else if (error < -800.0f) {
-        snprintf(buf, sizeof(buf), "Line: FULL");
-    } else {
-        int e_int = (int)error;
-        int e_dec = (int)((error - (float)e_int) * 10.0f);
-        if (e_dec < 0) e_dec = -e_dec;
-        snprintf(buf, sizeof(buf), "E:%+4d.%d S:%3u", e_int, e_dec, speed);
-    }
+    int st_int = (int)error;
+    snprintf(buf, sizeof(buf), "St:%+4d Sp:%3u", st_int, speed);
     OLED_Str(buf, 0, 2);
 
     /* Row 4: 灰階 8-bit pattern */
@@ -258,6 +249,63 @@ int main(void)
 
     /* 馬達初始化 */
     Motor_Init();
+
+    /* ── ESC 調試模式：開機按住按鍵進入 ── */
+    if (PORT_BTN->IDR & PIN_BTN) {
+        /* 重設 PB8 為 TIM4 AF2 PWM */
+        GPIO_InitTypeDef gt = {0};
+        gt.Pin       = PIN_ESC;
+        gt.Mode      = GPIO_MODE_AF_PP;
+        gt.Pull      = GPIO_NOPULL;
+        gt.Alternate = GPIO_AF2_TIM4;
+        HAL_GPIO_Init(PORT_ESC_FAN, &gt);
+
+        /* 啟動 TIM4 ESC PWM */
+        RCC->APB1ENR |= RCC_APB1ENR_TIM4EN;
+        TIM4->PSC  = 159;   TIM4->ARR  = 1999;
+        TIM4->CCR3 = 110;   /* 1100µs */
+        TIM4->CCMR2 = (6 << 4) | (1 << 3);
+        TIM4->CCER  = TIM_CCER_CC3E;
+        TIM4->CR1   = TIM_CR1_CEN;
+
+        OLED_Clear();
+        OLED_Str("ESC CAL MODE", 0, 0);
+        OLED_Str("Release BTN", 0, 2);
+        OLED_Str("then press:",  0, 4);
+        OLED_Str("1940 <-> 1100", 0, 6);
+        OLED_Flush();
+
+        /* 放開按鍵 */
+        while (PORT_BTN->IDR & PIN_BTN) HAL_Delay(10);
+
+        uint16_t esc_us = 1100;
+        uint8_t  btn_last = 0;
+        char buf[24];
+
+        OLED_Clear();
+        snprintf(buf, sizeof(buf), "ESC: %4u us", esc_us);
+        OLED_Str(buf, 12, 3);
+        OLED_Flush();
+
+        while (1) {
+            uint8_t btn = (PORT_BTN->IDR & PIN_BTN) ? 1 : 0;
+            uint8_t rising = btn && !btn_last;
+
+            if (rising) {
+                /* 按鍵: 1940 ↔ 1100 切換 */
+                esc_us = (esc_us == 1100) ? 1940 : 1100;
+                TIM4->CCR3 = esc_us / 10;
+
+                OLED_Clear();
+                snprintf(buf, sizeof(buf), "ESC: %4u us", esc_us);
+                OLED_Str(buf, 12, 3);
+                OLED_Flush();
+            }
+
+            btn_last = btn;
+            HAL_Delay(10);
+        }
+    }
     /* PID 初始化 */
     PID_t pid_pos;
     PID_Init(&pid_pos, KP_INIT, KI_INIT, KD_INIT, I_LIMIT, OUTPUT_LIMIT);
@@ -279,11 +327,8 @@ int main(void)
     uint32_t elapsed_ms  = 0;
     uint8_t  oob_cnt     = 0;
 
-    /* 編碼器 + 濾波 */
+    /* 編碼器 */
     int32_t enc_l_prev = 0, enc_r_prev = 0;
-    uint8_t enc_inited  = 0;
-    float   err_hist[3] = {0, 0, 0};
-    uint8_t err_idx = 0;
 
     while (1)
     {
@@ -341,12 +386,6 @@ int main(void)
                 state = STATE_RUNNING;
                 start_time = now;
                 elapsed_ms = 0;
-                enc_l_prev = (int32_t)TIM1->CNT;
-                enc_r_prev = (int32_t)TIM8->CNT;
-                enc_inited = 1;
-                /* 初始化低通濾波器 */
-                err_hist[0] = err_hist[1] = err_hist[2] = 0.0f;
-                err_idx = 0;
             }
             Motor_Brake();
             break;
@@ -355,58 +394,29 @@ int main(void)
         case STATE_RUNNING: {
             elapsed_ms = now - start_time;
 
-            /* 讀取灰階 */
+            /* 讀取灰階 → 加權平均 → error */
             uint8_t gray = Gray_Read();
-            float error = Line_GetError(gray);
+            float   error = Line_GetError(gray);
 
-            /* 出界偵測 */
-            if (error == LINE_LOST || (error > -800.0f && error < 800.0f
-                                       && (error > OOB_ERROR_MM || error < -OOB_ERROR_MM))) {
-                oob_cnt++;
-                if (oob_cnt > OOB_COUNT_MAX) {
-                    state = STATE_OOB;
-                    Motor_Brake();
-                    break;
-                }
-            } else {
-                if (oob_cnt > 0) oob_cnt--;
-            }
+            /* 固定 PD */
+            float steering = 0.0f;
+            float e_abs = (error > 0) ? error : -error;
 
-            /* 低通濾波: 抑制單次 flicker 造成的突發轉向 */
-            err_hist[err_idx] = error;
-            err_idx = (err_idx + 1) % 3;
-            float error_f = (err_hist[0] + err_hist[1] + err_hist[2]) / 3.0f;
-
-            /* PID 計算: 大誤差→提高 KP (彎道加強) */
-            float steering;
-            if (error_f > 800.0f || error_f < -800.0f) {
+            if (error == LINE_LOST || error == LINE_FULL) {
                 steering = 0.0f;
             } else {
-                float e_abs = (error_f > 0) ? error_f : -error_f;
-                float saved_kp = pid_pos.Kp;
-                if (e_abs > 10.0f) pid_pos.Kp = KP_INIT * 3.0f;
-                steering = PID_Compute(&pid_pos, 0.0f, error_f, dt);
-                pid_pos.Kp = saved_kp;
+                steering = PID_Compute(&pid_pos, 0.0f, error, dt);
             }
+
+            /* 速度曲線: 陡降, 大彎更慢 = 更多修正時間 */
+            float ratio = 1.0f - e_abs * 0.022f;
+            if (ratio < 0.30f) ratio = 0.30f;
+            uint16_t cur_speed = (uint16_t)((float)FIXED_SPEED * ratio);
 
             /* 馬達輸出 */
-            int16_t pwm_l = (int16_t)BASE_SPEED + (int16_t)steering;
-            int16_t pwm_r = (int16_t)BASE_SPEED - (int16_t)steering;
-
-            /* 讀編碼器差值 (正值=左輪快→應右偏) */
-            if (enc_inited) {
-                int32_t enc_l = (int32_t)TIM1->CNT;
-                int32_t enc_r = (int32_t)TIM8->CNT;
-                int32_t dl = enc_l - enc_l_prev;
-                int32_t dr = enc_r - enc_r_prev;
-                enc_l_prev = enc_l;
-                enc_r_prev = enc_r;
-                g_enc_diff = dl - dr;
-            }
-
-            /* 右輪 PWM 補償 */
-            pwm_r += RIGHT_TRIM;
-
+            int16_t pwm_l = (int16_t)cur_speed - (int16_t)steering;
+            int16_t pwm_r = (int16_t)cur_speed + (int16_t)steering + RIGHT_TRIM;
+            g_steering = steering;  /* 供 OLED */
             Motor_SetSpeed(pwm_l, pwm_r);
             break;
         }
@@ -423,7 +433,7 @@ int main(void)
             last_oled = now;
             uint8_t gray = Gray_Read();
             float error = Line_GetError(gray);
-            OLED_ShowDebug(state, error, BASE_SPEED, gray, elapsed_ms);
+            OLED_ShowDebug(state, g_steering, FIXED_SPEED, gray, elapsed_ms);
         }
     }
 }
@@ -555,6 +565,7 @@ static void MX_GPIO_Init(void)
     OLED_DC_LO();
     OLED_RES_HI();
     Motor_Coast();
+    HAL_GPIO_WritePin(PORT_ESC_FAN, PIN_ESC, GPIO_PIN_RESET);  /* 強制 PB8 LOW */
 }
 
 void Error_Handler(void)

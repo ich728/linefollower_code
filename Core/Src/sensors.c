@@ -52,10 +52,7 @@ uint8_t Gray_Read(void)
 }
 
 /**
-  * @brief  邊緣檢測法計算線位置
-  *
-  *   取最左和最右看到黑線的感測器中點 = 線中心
-  *   解決加權平均在單/多感測器時結果不一致的問題
+  * @brief  加權平均法計算線位置 (最簡)
   *   0 = 正中, 負 = 偏左, 正 = 偏右
   */
 float Line_GetError(uint8_t gray)
@@ -63,17 +60,9 @@ float Line_GetError(uint8_t gray)
     if (gray == 0x00) return LINE_LOST;
     if (gray == 0xFF) return LINE_FULL;
 
-    /* 找最左和最右的 ON 感測器 */
-    int left  = 8;   /* 初始: 最右+1 */
-    int right = -1;  /* 初始: 最左-1 */
-
+    int32_t w_sum = 0, count = 0;
     for (int i = 0; i < 8; i++) {
-        if (gray & (1 << i)) {
-            if (i < left)  left  = i;
-            if (i > right) right = i;
-        }
+        if (gray & (1 << i)) { w_sum += sensor_pos[i]; count++; }
     }
-
-    /* 線中心 = 左右邊界中點 */
-    return (float)(sensor_pos[left] + sensor_pos[right]) / 2.0f;
+    return (float)w_sum / (float)count;
 }
