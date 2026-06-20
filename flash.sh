@@ -1,18 +1,22 @@
 #!/bin/bash
 set -e
 
-CMAKE="C:/Users/ICH728/AppData/Local/stm32cube/bundles/cmake/4.3.1+st.1/bin/cmake.exe"
-OPENOCD="C:/Users/ICH728/AppData/Local/openocd/bin/openocd.exe"
-SCRIPTS="C:/Users/ICH728/AppData/Local/openocd/share/openocd/scripts"
-
 cd "$(dirname "$0")"
 
+command -v cmake >/dev/null || { echo "ERROR: cmake was not found on PATH."; exit 1; }
+command -v openocd >/dev/null || { echo "ERROR: openocd was not found on PATH."; exit 1; }
+
+if [ ! -f build/Debug/build.ninja ]; then
+    echo "=== Configure ==="
+    cmake --preset Debug
+fi
+
 echo "=== Build ==="
-"$CMAKE" --build build/Debug
+cmake --build --preset Debug
 
 echo ""
 echo "=== Flash ==="
-"$OPENOCD" -s "$SCRIPTS" \
+openocd \
     -f interface/cmsis-dap.cfg \
     -c "transport select swd" \
     -c "adapter speed 100" \

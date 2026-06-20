@@ -17,19 +17,24 @@
 /* USER CODE BEGIN PD */
 /* ======================== 控制參數 ======================== */
 #define LOOP_MS         5        /* 控制迴圈週期 (200Hz)          */
+#define MOTOR_DIAGNOSTIC_MODE 0  /* 1=低速左右輪/編碼器診斷       */
+#define OLED_ENABLED         0  /* 實機未安裝 OLED，禁止阻塞刷新   */
+#define ESC_DIAGNOSTIC_MODE  0  /* 禁止開機按住按鍵進入隱藏模式   */
+#define DIAG_PWM              120
+#define DIAG_RUN_MS          1000U
 #define FIXED_SPEED     200      /* 降速以減弱慣性                 */
 #define RIGHT_TRIM      25       /* 右輪 PWM 補償                  */
 
 /* PID */
-#define KP_INIT         0.80f    /* P: 彎道靈敏                   */
-#define KI_INIT         0.00f    /* I: 不加                       */
-#define KD_INIT         0.12f    /* D: dt減半, KD同步降            */
+#define KP_INIT         1.35f    /* 提高彎道跟隨能力               */
+#define KI_INIT         0.00f    /* 暫不積分，避免出彎後積分甩尾   */
+#define KD_INIT         0.015f   /* 小 D 抑制左右擺動              */
 #define I_LIMIT         100.0f
-#define OUTPUT_LIMIT    400.0f
+#define OUTPUT_LIMIT    150.0f   /* 允許急彎有足夠左右輪差         */
 
 /* 出界判定閾值 */
 #define OOB_ERROR_MM    40.0f    /* 線誤差超過此值視為偏離       */
-#define OOB_COUNT_MAX   5        /* 連續 5 次 (~50ms) 觸發出界   */
+#define OOB_COUNT_MAX   6        /* 連續 6 次 (約 30ms) 觸發停車 */
 
 /* ======================== 狀態機 ======================== */
 typedef enum {
@@ -217,6 +222,71 @@ static void OLED_ShowDebug(State_t state, float error, uint16_t speed,
 
     OLED_Flush();
 }
+
+/* ======================== 馬達/編碼器診斷模式 ======================== */
+static void Motor_Diagnostic_Run(void)
+{
+    uint8_t test_step = 0;
+    uint8_t btn_last = 0;
+
+    Motor_SetPWM(0, 0);
+    Motor_Brake();
+    OLED_Clear();
+    OLED_Str("MOTOR DIAG", 30, 0);
+    OLED_Str("WHEELS UP!", 30, 2);
+    OLED_Str("Press BTN", 36, 4);
+    OLED_Str("1:L 2:R 3:BOTH", 12, 6);
+    OLED_Flush();
+
+    while (1) {
+        uint8_t btn = (PORT_BTN->IDR & PIN_BTN) ? 1 : 0;
+        uint8_t released = !btn && btn_last;
+        btn_last = btn;
+
+        if (!released) {
+            HAL_Delay(10);
+            continue;
+        }
+
+        HAL_Delay(30);
+        test_step = (uint8_t)((test_step % 3U) + 1U);
+        TIM1->CNT = 0;
+        TIM8->CNT = 0;
+
+        OLED_Clear();
+        if (test_step == 1) {
+            OLED_Str("CMD LEFT", 36, 0);
+            OLED_Str("ONLY LEFT?", 30, 3);
+            Motor_SetSpeed(DIAG_PWM, 0);
+        } else if (test_step == 2) {
+            OLED_Str("CMD RIGHT", 33, 0);
+            OLED_Str("ONLY RIGHT?", 27, 3);
+            Motor_SetSpeed(0, DIAG_PWM);
+        } else {
+            OLED_Str("CMD BOTH", 36, 0);
+            OLED_Str("BOTH FORWARD?", 21, 3);
+            Motor_SetSpeed(DIAG_PWM, DIAG_PWM);
+        }
+        OLED_Flush();
+
+        HAL_Delay(DIAG_RUN_MS);
+        Motor_SetPWM(0, 0);
+        Motor_Brake();
+
+        int32_t count_l = (int16_t)(uint16_t)TIM1->CNT;
+        int32_t count_r = (int16_t)(uint16_t)TIM8->CNT;
+        char line[24];
+
+        OLED_Clear();
+        OLED_Str("TEST DONE", 36, 0);
+        snprintf(line, sizeof(line), "TIM1 L:%+5ld", (long)count_l);
+        OLED_Str(line, 6, 2);
+        snprintf(line, sizeof(line), "TIM8 R:%+5ld", (long)count_r);
+        OLED_Str(line, 6, 4);
+        OLED_Str("Press next", 33, 6);
+        OLED_Flush();
+    }
+}
 /* USER CODE END 0 */
 
 /* USER CODE BEGIN PV */
@@ -250,7 +320,13 @@ int main(void)
     /* 馬達初始化 */
     Motor_Init();
 
+#if MOTOR_DIAGNOSTIC_MODE && OLED_ENABLED
+    OLED_Init();
+    Motor_Diagnostic_Run();
+#endif
+
     /* ── ESC 調試模式：開機按住按鍵進入 ── */
+#if ESC_DIAGNOSTIC_MODE
     if (PORT_BTN->IDR & PIN_BTN) {
         /* 重設 PB8 為 TIM4 AF2 PWM */
         GPIO_InitTypeDef gt = {0};
@@ -306,11 +382,13 @@ int main(void)
             HAL_Delay(10);
         }
     }
+#endif
     /* PID 初始化 */
     PID_t pid_pos;
     PID_Init(&pid_pos, KP_INIT, KI_INIT, KD_INIT, I_LIMIT, OUTPUT_LIMIT);
 
     /* ===== OLED 啟動提示 ===== */
+#if OLED_ENABLED
     OLED_Init();
     OLED_Clear();
 
@@ -319,6 +397,7 @@ int main(void)
     OLED_Str("READY", 36, 1);
     OLED_Str("Press BTN", 24, 3);
     OLED_Flush();
+#endif
 
     /* ======================== 主迴圈 ======================== */
     State_t state = STATE_IDLE;
@@ -398,7 +477,25 @@ int main(void)
             uint8_t gray = Gray_Read();
             float   error = Line_GetError(gray);
 
-            /* 固定 PD */
+            /*
+             * 连续全白代表车辆已经脱离黑线。短暂一两帧可能只是传感器
+             * 间隙，因此累计约 30ms 后才停车。
+             */
+            if (error == LINE_LOST) {
+                if (oob_cnt < OOB_COUNT_MAX) oob_cnt++;
+                if (oob_cnt >= OOB_COUNT_MAX) {
+                    Motor_SetPWM(0, 0);
+                    Motor_Brake();
+                    PID_Reset(&pid_pos);
+                    g_steering = 0.0f;
+                    state = STATE_OOB;
+                    break;
+                }
+            } else {
+                oob_cnt = 0;
+            }
+
+            /* PD：全黑区不进行转向，避免通过标志线时误打方向。 */
             float steering = 0.0f;
             float e_abs = (error > 0) ? error : -error;
 
@@ -409,13 +506,16 @@ int main(void)
             }
 
             /* 速度曲線: 陡降, 大彎更慢 = 更多修正時間 */
-            float ratio = 1.0f - e_abs * 0.022f;
-            if (ratio < 0.30f) ratio = 0.30f;
+            float ratio = 1.0f - e_abs * 0.014f;
+            if (ratio < 0.35f) ratio = 0.35f;
             uint16_t cur_speed = (uint16_t)((float)FIXED_SPEED * ratio);
 
             /* 馬達輸出 */
             int16_t pwm_l = (int16_t)cur_speed - (int16_t)steering;
             int16_t pwm_r = (int16_t)cur_speed + (int16_t)steering + RIGHT_TRIM;
+            /* 首輪彎道測試不允許單輪反轉，避免直接甩出賽道。 */
+            if (pwm_l < 0) pwm_l = 0;
+            if (pwm_r < 0) pwm_r = 0;
             g_steering = steering;  /* 供 OLED */
             Motor_SetSpeed(pwm_l, pwm_r);
             break;
@@ -428,6 +528,7 @@ int main(void)
         }
 
         /* ---- OLED 更新 (10Hz) ---- */
+#if OLED_ENABLED
         static uint32_t last_oled;
         if (now - last_oled >= 100) {
             last_oled = now;
@@ -435,6 +536,7 @@ int main(void)
             float error = Line_GetError(gray);
             OLED_ShowDebug(state, g_steering, FIXED_SPEED, gray, elapsed_ms);
         }
+#endif
     }
 }
 
