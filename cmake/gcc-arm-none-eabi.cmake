@@ -4,15 +4,37 @@ set(CMAKE_SYSTEM_PROCESSOR          arm)
 set(CMAKE_C_COMPILER_ID GNU)
 set(CMAKE_CXX_COMPILER_ID GNU)
 
-# Some default GCC settings
-# arm-none-eabi- must be part of path environment
-set(TOOLCHAIN_PATH "C:/Users/ICH728/AppData/Local/stm32cube/bundles/gnu-tools-for-stm32/14.3.1+st.2/bin")
-set(CMAKE_C_COMPILER    "${TOOLCHAIN_PATH}/arm-none-eabi-gcc.exe")
-set(CMAKE_ASM_COMPILER  "${TOOLCHAIN_PATH}/arm-none-eabi-gcc.exe")
-set(CMAKE_CXX_COMPILER  "${TOOLCHAIN_PATH}/arm-none-eabi-g++.exe")
-set(CMAKE_LINKER        "${TOOLCHAIN_PATH}/arm-none-eabi-g++.exe")
-set(CMAKE_OBJCOPY       "${TOOLCHAIN_PATH}/arm-none-eabi-objcopy.exe")
-set(CMAKE_SIZE          "${TOOLCHAIN_PATH}/arm-none-eabi-size.exe")
+# Arm GNU Toolchain must be available on PATH. An explicit installation can
+# also be selected by configuring with -DARM_TOOLCHAIN_ROOT=<toolchain root>.
+set(ARM_TOOLCHAIN_ROOT "" CACHE PATH "Arm GNU Toolchain installation root")
+if(ARM_TOOLCHAIN_ROOT)
+    set(TOOLCHAIN_BIN_HINT "${ARM_TOOLCHAIN_ROOT}/bin")
+endif()
+
+find_program(CMAKE_C_COMPILER
+    NAMES arm-none-eabi-gcc
+    HINTS "${TOOLCHAIN_BIN_HINT}"
+    REQUIRED)
+find_program(CMAKE_ASM_COMPILER
+    NAMES arm-none-eabi-gcc
+    HINTS "${TOOLCHAIN_BIN_HINT}"
+    REQUIRED)
+find_program(CMAKE_CXX_COMPILER
+    NAMES arm-none-eabi-g++
+    HINTS "${TOOLCHAIN_BIN_HINT}"
+    REQUIRED)
+find_program(CMAKE_LINKER
+    NAMES arm-none-eabi-g++
+    HINTS "${TOOLCHAIN_BIN_HINT}"
+    REQUIRED)
+find_program(CMAKE_OBJCOPY
+    NAMES arm-none-eabi-objcopy
+    HINTS "${TOOLCHAIN_BIN_HINT}"
+    REQUIRED)
+find_program(CMAKE_SIZE
+    NAMES arm-none-eabi-size
+    HINTS "${TOOLCHAIN_BIN_HINT}"
+    REQUIRED)
 
 set(CMAKE_EXECUTABLE_SUFFIX_ASM     ".elf")
 set(CMAKE_EXECUTABLE_SUFFIX_C       ".elf")

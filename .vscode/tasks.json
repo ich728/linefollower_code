@@ -2,20 +2,37 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Build & Flash",
+            "label": "Configure Debug",
             "type": "shell",
-            "command": "${workspaceFolder}/flash.bat",
+            "command": "cmake",
+            "args": [
+                "--preset",
+                "Debug"
+            ],
+            "problemMatcher": []
+        },
+        {
+            "label": "Build Debug",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "--preset",
+                "Debug"
+            ],
+            "dependsOn": "Configure Debug",
             "group": {
                 "kind": "build",
                 "isDefault": true
             },
-            "problemMatcher": [],
-            "options": {
-                "shell": {
-                    "executable": "powershell.exe",
-                    "args": ["-Command"]
-                }
-            }
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Build & Flash",
+            "type": "shell",
+            "command": "${workspaceFolder}/flash.bat",
+            "dependsOn": "Configure Debug",
+            "problemMatcher": []
         }
     ]
 }

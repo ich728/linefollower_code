@@ -22,6 +22,8 @@ set(MX_Application_Src
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/main.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/sensors.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/motor.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/encoder.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/speed_control.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/pid.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/stm32f4xx_it.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/stm32f4xx_hal_msp.c

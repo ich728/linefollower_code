@@ -17,21 +17,63 @@
 /* USER CODE BEGIN PD */
 /* ======================== 控制參數 ======================== */
 #define LOOP_MS         5        /* 控制迴圈週期 (200Hz)          */
+#define DISTANCE_UART_DIAGNOSTIC_MODE 0
+#define MOTOR_DIAGNOSTIC_MODE 0  /* 1=低速左右輪/編碼器診斷       */
+#define OLED_ENABLED         0  /* 實機未安裝 OLED，禁止阻塞刷新   */
+#define ESC_DIAGNOSTIC_MODE  0  /* 禁止開機按住按鍵進入隱藏模式   */
+#define DIAG_PWM              120
+#define DIAG_RUN_MS          1000U
 #define FIXED_SPEED     200      /* 降速以減弱慣性                 */
 #define RIGHT_TRIM      25       /* 右輪 PWM 補償                  */
 
 /* PID */
-#define KP_INIT         0.80f    /* P: 彎道靈敏                   */
-#define KI_INIT         0.00f    /* I: 不加                       */
-#define KD_INIT         0.12f    /* D: dt減半, KD同步降            */
+#define KP_INIT         1.35f    /* 提高彎道跟隨能力               */
+#define KI_INIT         0.00f    /* 暫不積分，避免出彎後積分甩尾   */
+#define KD_INIT         0.015f   /* 小 D 抑制左右擺動              */
 #define I_LIMIT         100.0f
-#define OUTPUT_LIMIT    400.0f
+#define OUTPUT_LIMIT    150.0f   /* 允許急彎有足夠左右輪差         */
 
 /* 出界判定閾值 */
 #define OOB_ERROR_MM    40.0f    /* 線誤差超過此值視為偏離       */
-#define OOB_COUNT_MAX   5        /* 連續 5 次 (~50ms) 觸發出界   */
+#define LINE_LOST_GRACE_COUNT 64 /* 约 320ms 沿最后方向寻找黑线    */
+#define LINE_LOST_SPEED       70 /* 急弯失线期间更低速搜索         */
+#define LINE_LOST_STEER_GAIN 1.00f
+#define SHARP_TURN_ERROR_MM  30.0f
+#define SHARP_TURN_GAIN       1.25f
+#define SHARP_TURN_LIMIT    175.0f
+#define SENSOR_LEFT_HALF_MASK   0x0FU /* CH1-CH4 */
+#define SENSOR_RIGHT_HALF_MASK  0xF0U /* CH5-CH8 */
+#define SENSOR_CENTER_MASK      0x18U /* CH4-CH5 */
+#define ZIGZAG_SPEED             125
+#define ZIGZAG_STEERING        115.0f
+#define ZIGZAG_MAX_COUNT         80U  /* 单次强制急转最多约 400ms */
+#define ZIGZAG_MIN_COUNT          6U  /* 至少保持约 30ms */
+#define GAP_ENTRY_ERROR_MM       12.0f /* 接近中心时全白判为直线断线 */
+#define GAP_CROSS_SPEED           180
+#define GAP_MAX_ENCODER_COUNTS  24000U /* 双轮平均计数安全上限 */
+#define GAP_MAX_COUNT             200U /* 最多约 1 秒 */
 
 /* ======================== 狀態機 ======================== */
+/* SDM02 obstacle avoidance parameters (first hardware-test version). */
+#define OBSTACLE_TRIGGER_MM        270U
+#define OBSTACLE_CLEAR_MM          350U
+#define OBSTACLE_CONFIRM_FRAMES      2U
+#define OBSTACLE_FRAME_TIMEOUT_MS   120U
+#define OBSTACLE_PWM                205
+#define OBSTACLE_RETURN_PIVOT_PWM   170
+#define OBSTACLE_ALIGN_PWM          145
+#define OBSTACLE_INNER_PWM            0
+#define OBSTACLE_STRAIGHT_PWM       215
+#define OBSTACLE_BRAKE_MS             0U
+#define OBSTACLE_PIVOT_MS           255U
+#define OBSTACLE_SIDE_MS            300U
+#define OBSTACLE_PASS_MS            620U
+#define OBSTACLE_LINE_CONFIRM         2U
+#define OBSTACLE_SEEK_TIMEOUT_MS    600U
+#define OBSTACLE_ALIGN_MIN_MS         90U
+#define OBSTACLE_ALIGN_MAX_MS        650U
+#define OBSTACLE_SETTLE_MS           50U
+
 typedef enum {
     STATE_IDLE,          /* 等待按鍵啟動                        */
     STATE_COUNTDOWN,     /* 倒數 3 秒後啟動                     */
@@ -39,6 +81,20 @@ typedef enum {
     STATE_FINISHED,      /* 完成一圈                            */
     STATE_OOB            /* 出界                                */
 } State_t;
+
+typedef enum {
+    OBS_IDLE = 0,
+    OBS_BRAKE,
+    OBS_TURN_OUT,
+    OBS_MOVE_SIDE,
+    OBS_TURN_PARALLEL,
+    OBS_PASS_BLOCK,
+    OBS_TURN_TO_LINE,
+    OBS_SEEK_LINE,
+    OBS_ALIGN_TRACK,
+    OBS_SETTLE,
+    OBS_FAILED
+} ObstacleState_t;
 
 /* ======================== OLED 5×8 字型 ======================== */
 static const uint8_t font5x8[91][5] = {
@@ -94,6 +150,309 @@ static const uint8_t font5x8[91][5] = {
 /* USER CODE BEGIN 0 */
 static int32_t  g_enc_diff;    /* 編碼器差值 */
 static float    g_steering;     /* PID 輸出供 OLED */
+
+volatile uint32_t distance_diag_magic = 0x53444D32U; /* "SDM2" */
+volatile uint32_t distance_diag_count;
+volatile uint32_t distance_diag_errors;
+volatile uint32_t distance_diag_valid_frames;
+volatile uint32_t distance_diag_checksum_errors;
+volatile uint16_t distance_diag_mm = 0xFFFFU;
+volatile uint32_t distance_diag_last_tick;
+volatile uint8_t distance_diag_raw[32];
+
+static volatile uint8_t distance_frame[4];
+static volatile uint8_t distance_frame_index;
+static uint32_t distance_last_restart_tick;
+
+static ObstacleState_t obstacle_state = OBS_IDLE;
+static uint32_t obstacle_phase_start;
+static uint32_t obstacle_last_frame;
+static uint8_t obstacle_confirm_count;
+static uint8_t obstacle_line_count;
+static uint8_t obstacle_completed;
+static uint8_t obstacle_just_completed;
+
+static void Distance_UART1_SendStart(void)
+{
+    static const uint8_t start_measurement[] =
+        {0x5A, 0x0A, 0x02, 0x02, 0x00, 0xF1};
+
+    for (uint32_t i = 0; i < sizeof(start_measurement); i++) {
+        while (!(USART1->SR & USART_SR_TXE)) {}
+        USART1->DR = start_measurement[i];
+    }
+    while (!(USART1->SR & USART_SR_TC)) {}
+    distance_last_restart_tick = HAL_GetTick();
+}
+
+static void Distance_UART1_Init(void)
+{
+    /* PA9=USART1_TX, PA10=USART1_RX, AF7. */
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+    RCC->APB2ENR |= RCC_APB2ENR_USART1EN;
+    (void)RCC->APB2ENR;
+
+    GPIOA->MODER &= ~((3U << (9U * 2U)) | (3U << (10U * 2U)));
+    GPIOA->MODER |=  ((2U << (9U * 2U)) | (2U << (10U * 2U)));
+    GPIOA->AFR[1] &= ~((0xFU << 4U) | (0xFU << 8U));
+    GPIOA->AFR[1] |=  ((7U << 4U) | (7U << 8U));
+    GPIOA->PUPDR &= ~((3U << (9U * 2U)) | (3U << (10U * 2U)));
+    GPIOA->PUPDR |=  (1U << (10U * 2U)); /* RX pull-up */
+    GPIOA->OSPEEDR |= (3U << (9U * 2U)) | (3U << (10U * 2U));
+
+    USART1->CR1 = 0;
+    USART1->CR2 = 0;
+    USART1->CR3 = 0;
+    /* PCLK2=16MHz, 115200 baud, oversampling by 16: BRR ≈ 0x008B. */
+    USART1->BRR = 0x008BU;
+    USART1->CR1 = USART_CR1_RE | USART_CR1_TE | USART_CR1_UE;
+
+    distance_diag_count = 0;
+    distance_diag_errors = 0;
+    distance_diag_valid_frames = 0;
+    distance_diag_checksum_errors = 0;
+    distance_diag_mm = 0xFFFFU;
+    distance_diag_last_tick = 0;
+    distance_frame_index = 0;
+    distance_last_restart_tick = 0;
+
+    HAL_Delay(300);
+    Distance_UART1_SendStart();
+    HAL_Delay(20);
+
+    /* Clear a possible command echo before enabling continuous RX IRQ. */
+    while (USART1->SR & USART_SR_RXNE) {
+        (void)USART1->DR;
+    }
+    USART1->CR1 |= USART_CR1_RXNEIE;
+    HAL_NVIC_SetPriority(USART1_IRQn, 2, 0);
+    HAL_NVIC_EnableIRQ(USART1_IRQn);
+}
+
+static void Distance_UART1_Service(uint32_t now)
+{
+    uint8_t stale = (distance_diag_last_tick == 0U) ||
+                    ((now - distance_diag_last_tick) > 500U);
+    if (stale && (now - distance_last_restart_tick) >= 500U) {
+        Distance_UART1_SendStart();
+    }
+}
+
+void USART1_IRQHandler(void)
+{
+    uint32_t sr = USART1->SR;
+    if (sr & (USART_SR_ORE | USART_SR_NE | USART_SR_FE | USART_SR_PE)) {
+        distance_diag_errors++;
+        (void)USART1->DR;
+        distance_frame_index = 0;
+        return;
+    }
+
+    if (sr & USART_SR_RXNE) {
+        uint8_t value = (uint8_t)USART1->DR;
+        uint32_t raw_index = distance_diag_count++;
+        if (raw_index < sizeof(distance_diag_raw)) {
+            distance_diag_raw[raw_index] = value;
+        }
+
+        if (distance_frame_index == 0U) {
+            if (value == 0x5CU) {
+                distance_frame[0] = value;
+                distance_frame_index = 1U;
+            }
+        } else {
+            distance_frame[distance_frame_index++] = value;
+            if (distance_frame_index == 4U) {
+                uint8_t checksum = (uint8_t)~(
+                    (uint8_t)(distance_frame[1] + distance_frame[2]));
+                if (distance_frame[3] == checksum) {
+                    distance_diag_mm =
+                        (uint16_t)distance_frame[1] |
+                        ((uint16_t)distance_frame[2] << 8U);
+                    distance_diag_valid_frames++;
+                    distance_diag_last_tick = HAL_GetTick();
+                } else {
+                    distance_diag_checksum_errors++;
+                }
+                distance_frame_index = 0U;
+            }
+        }
+    }
+}
+
+static void Obstacle_Reset(void)
+{
+    obstacle_state = OBS_IDLE;
+    obstacle_phase_start = 0;
+    obstacle_last_frame = distance_diag_valid_frames;
+    obstacle_confirm_count = 0;
+    obstacle_line_count = 0;
+    obstacle_completed = 0;
+    obstacle_just_completed = 0;
+}
+
+static uint8_t Obstacle_Update(uint32_t now, uint8_t gray)
+{
+    uint32_t valid_frames = distance_diag_valid_frames;
+    uint16_t distance_mm = distance_diag_mm;
+    uint8_t distance_fresh =
+        (now - distance_diag_last_tick) <= OBSTACLE_FRAME_TIMEOUT_MS;
+
+    if (obstacle_state == OBS_IDLE) {
+        if (!obstacle_completed && valid_frames != obstacle_last_frame) {
+            obstacle_last_frame = valid_frames;
+            if (distance_fresh && distance_mm >= 30U &&
+                distance_mm <= OBSTACLE_TRIGGER_MM) {
+                if (obstacle_confirm_count < OBSTACLE_CONFIRM_FRAMES) {
+                    obstacle_confirm_count++;
+                }
+            } else {
+                obstacle_confirm_count = 0;
+            }
+
+            if (obstacle_confirm_count >= OBSTACLE_CONFIRM_FRAMES) {
+                obstacle_state = OBS_BRAKE;
+                obstacle_phase_start = now;
+                obstacle_line_count = 0;
+            }
+        }
+        return 0;
+    }
+
+    uint32_t phase_ms = now - obstacle_phase_start;
+    switch (obstacle_state) {
+    case OBS_BRAKE:
+        Motor_SetSpeed(OBSTACLE_PWM, -OBSTACLE_PWM);
+        if (phase_ms >= OBSTACLE_BRAKE_MS) {
+            obstacle_state = OBS_TURN_OUT;
+            obstacle_phase_start = now;
+        }
+        break;
+
+    case OBS_TURN_OUT:
+        /* Pivot right by approximately 90 degrees. */
+        Motor_SetSpeed(OBSTACLE_PWM, -OBSTACLE_PWM);
+        if (phase_ms >= OBSTACLE_PIVOT_MS) {
+            obstacle_state = OBS_MOVE_SIDE;
+            obstacle_phase_start = now;
+        }
+        break;
+
+    case OBS_MOVE_SIDE:
+        Motor_SetSpeed(OBSTACLE_STRAIGHT_PWM,
+                       OBSTACLE_STRAIGHT_PWM + RIGHT_TRIM);
+        if (phase_ms >= OBSTACLE_SIDE_MS) {
+            obstacle_state = OBS_TURN_PARALLEL;
+            obstacle_phase_start = now;
+        }
+        break;
+
+    case OBS_TURN_PARALLEL:
+        /* Pivot left to become parallel with the track. */
+        Motor_SetSpeed(-OBSTACLE_PWM, OBSTACLE_PWM);
+        if (phase_ms >= OBSTACLE_PIVOT_MS) {
+            obstacle_state = OBS_PASS_BLOCK;
+            obstacle_phase_start = now;
+        }
+        break;
+
+    case OBS_PASS_BLOCK:
+        Motor_SetSpeed(OBSTACLE_STRAIGHT_PWM,
+                       OBSTACLE_STRAIGHT_PWM + RIGHT_TRIM);
+        if (phase_ms >= OBSTACLE_PASS_MS) {
+            obstacle_state = OBS_TURN_TO_LINE;
+            obstacle_phase_start = now;
+        }
+        break;
+
+    case OBS_TURN_TO_LINE:
+        /* Pivot left, then the next straight segment searches for the line. */
+        Motor_SetSpeed(-OBSTACLE_RETURN_PIVOT_PWM,
+                       OBSTACLE_RETURN_PIVOT_PWM);
+        if (phase_ms >= OBSTACLE_PIVOT_MS) {
+            obstacle_state = OBS_SEEK_LINE;
+            obstacle_phase_start = now;
+            obstacle_line_count = 0;
+        }
+        break;
+
+    case OBS_SEEK_LINE:
+        Motor_SetSpeed(OBSTACLE_STRAIGHT_PWM,
+                       OBSTACLE_STRAIGHT_PWM + RIGHT_TRIM);
+        if (gray != 0U) {
+            if (obstacle_line_count < OBSTACLE_LINE_CONFIRM) {
+                obstacle_line_count++;
+            }
+        } else {
+            obstacle_line_count = 0;
+        }
+        if (obstacle_line_count >= OBSTACLE_LINE_CONFIRM) {
+            obstacle_state = OBS_ALIGN_TRACK;
+            obstacle_phase_start = now;
+            obstacle_line_count = 0;
+        } else if (phase_ms >= OBSTACLE_SEEK_TIMEOUT_MS) {
+            obstacle_state = OBS_FAILED;
+        }
+        break;
+
+    case OBS_ALIGN_TRACK:
+        /*
+         * Pivot right until the track reaches the middle sensors.  The line
+         * is first reacquired by an edge sensor, so a fixed turn often exits
+         * before the chassis is actually aligned.
+         */
+        Motor_SetSpeed(OBSTACLE_ALIGN_PWM, -OBSTACLE_ALIGN_PWM);
+        if (phase_ms >= OBSTACLE_ALIGN_MIN_MS &&
+            (gray & SENSOR_CENTER_MASK) != 0U) {
+            if (obstacle_line_count < OBSTACLE_LINE_CONFIRM) {
+                obstacle_line_count++;
+            }
+        } else {
+            obstacle_line_count = 0;
+        }
+
+        if (obstacle_line_count >= OBSTACLE_LINE_CONFIRM) {
+            obstacle_state = OBS_SETTLE;
+            obstacle_phase_start = now;
+        } else if (phase_ms >= OBSTACLE_ALIGN_MAX_MS) {
+            /*
+             * If any sensor still sees the track, hand over gently instead
+             * of stopping on top of the line.  Stop only when truly lost.
+             */
+            if (gray != 0U) {
+                obstacle_state = OBS_SETTLE;
+                obstacle_phase_start = now;
+            } else {
+                obstacle_state = OBS_FAILED;
+            }
+        }
+        break;
+
+    case OBS_SETTLE:
+        /* Remove pivot inertia before handing control back to line PID. */
+        Motor_SetPWM(0, 0);
+        Motor_Brake();
+        if (phase_ms >= OBSTACLE_SETTLE_MS) {
+            obstacle_state = OBS_IDLE;
+            obstacle_completed = 1U;
+            obstacle_just_completed = 1U;
+            obstacle_confirm_count = 0;
+            return 0;
+        }
+        break;
+
+    case OBS_FAILED:
+        Motor_SetPWM(0, 0);
+        Motor_Brake();
+        break;
+
+    default:
+        obstacle_state = OBS_FAILED;
+        break;
+    }
+
+    return 1;
+}
 
 /* ======================== OLED (SPI2, PD3-6) ======================== */
 static uint8_t oled_buf[128][8];
@@ -217,6 +576,71 @@ static void OLED_ShowDebug(State_t state, float error, uint16_t speed,
 
     OLED_Flush();
 }
+
+/* ======================== 馬達/編碼器診斷模式 ======================== */
+static void Motor_Diagnostic_Run(void)
+{
+    uint8_t test_step = 0;
+    uint8_t btn_last = 0;
+
+    Motor_SetPWM(0, 0);
+    Motor_Brake();
+    OLED_Clear();
+    OLED_Str("MOTOR DIAG", 30, 0);
+    OLED_Str("WHEELS UP!", 30, 2);
+    OLED_Str("Press BTN", 36, 4);
+    OLED_Str("1:L 2:R 3:BOTH", 12, 6);
+    OLED_Flush();
+
+    while (1) {
+        uint8_t btn = (PORT_BTN->IDR & PIN_BTN) ? 1 : 0;
+        uint8_t released = !btn && btn_last;
+        btn_last = btn;
+
+        if (!released) {
+            HAL_Delay(10);
+            continue;
+        }
+
+        HAL_Delay(30);
+        test_step = (uint8_t)((test_step % 3U) + 1U);
+        TIM1->CNT = 0;
+        TIM8->CNT = 0;
+
+        OLED_Clear();
+        if (test_step == 1) {
+            OLED_Str("CMD LEFT", 36, 0);
+            OLED_Str("ONLY LEFT?", 30, 3);
+            Motor_SetSpeed(DIAG_PWM, 0);
+        } else if (test_step == 2) {
+            OLED_Str("CMD RIGHT", 33, 0);
+            OLED_Str("ONLY RIGHT?", 27, 3);
+            Motor_SetSpeed(0, DIAG_PWM);
+        } else {
+            OLED_Str("CMD BOTH", 36, 0);
+            OLED_Str("BOTH FORWARD?", 21, 3);
+            Motor_SetSpeed(DIAG_PWM, DIAG_PWM);
+        }
+        OLED_Flush();
+
+        HAL_Delay(DIAG_RUN_MS);
+        Motor_SetPWM(0, 0);
+        Motor_Brake();
+
+        int32_t count_l = (int16_t)(uint16_t)TIM1->CNT;
+        int32_t count_r = (int16_t)(uint16_t)TIM8->CNT;
+        char line[24];
+
+        OLED_Clear();
+        OLED_Str("TEST DONE", 36, 0);
+        snprintf(line, sizeof(line), "TIM1 L:%+5ld", (long)count_l);
+        OLED_Str(line, 6, 2);
+        snprintf(line, sizeof(line), "TIM8 R:%+5ld", (long)count_r);
+        OLED_Str(line, 6, 4);
+        OLED_Str("Press next", 33, 6);
+        OLED_Flush();
+    }
+}
 /* USER CODE END 0 */
 
 /* USER CODE BEGIN PV */
@@ -250,7 +674,16 @@ int main(void)
     /* 馬達初始化 */
     Motor_Init();
 
+    Distance_UART1_Init();
+    Obstacle_Reset();
+
+#if MOTOR_DIAGNOSTIC_MODE && OLED_ENABLED
+    OLED_Init();
+    Motor_Diagnostic_Run();
+#endif
+
     /* ── ESC 調試模式：開機按住按鍵進入 ── */
+#if ESC_DIAGNOSTIC_MODE
     if (PORT_BTN->IDR & PIN_BTN) {
         /* 重設 PB8 為 TIM4 AF2 PWM */
         GPIO_InitTypeDef gt = {0};
@@ -306,11 +739,13 @@ int main(void)
             HAL_Delay(10);
         }
     }
+#endif
     /* PID 初始化 */
     PID_t pid_pos;
     PID_Init(&pid_pos, KP_INIT, KI_INIT, KD_INIT, I_LIMIT, OUTPUT_LIMIT);
 
     /* ===== OLED 啟動提示 ===== */
+#if OLED_ENABLED
     OLED_Init();
     OLED_Clear();
 
@@ -319,21 +754,31 @@ int main(void)
     OLED_Str("READY", 36, 1);
     OLED_Str("Press BTN", 24, 3);
     OLED_Flush();
+#endif
 
     /* ======================== 主迴圈 ======================== */
     State_t state = STATE_IDLE;
     uint32_t last_loop   = HAL_GetTick();
     uint32_t start_time  = 0;
     uint32_t elapsed_ms  = 0;
-    uint8_t  oob_cnt     = 0;
+    uint8_t  line_lost_cnt = 0;
+    float last_valid_steering = 0.0f;
+    int8_t zigzag_dir = 0;       /* -1=左急转, +1=右急转 */
+    uint8_t zigzag_count = 0;
+    uint8_t gap_mode = 0;
+    uint16_t gap_count = 0;
+    uint32_t gap_encoder_counts = 0;
+    float last_valid_error = 0.0f;
 
     /* 編碼器 */
-    int32_t enc_l_prev = 0, enc_r_prev = 0;
+    uint16_t enc_l_prev = (uint16_t)TIM1->CNT;
+    uint16_t enc_r_prev = (uint16_t)TIM8->CNT;
 
     while (1)
     {
         /* ---- 100Hz timing ---- */
         uint32_t now = HAL_GetTick();
+        Distance_UART1_Service(now);
         if (now - last_loop < LOOP_MS) continue;
         float dt = (float)(now - last_loop) / 1000.0f;
         last_loop = now;
@@ -362,6 +807,17 @@ int main(void)
             state = STATE_COUNTDOWN;
             start_time = now;
             PID_Reset(&pid_pos);
+            line_lost_cnt = 0;
+            last_valid_steering = 0.0f;
+            zigzag_dir = 0;
+            zigzag_count = 0;
+            gap_mode = 0;
+            gap_count = 0;
+            gap_encoder_counts = 0;
+            last_valid_error = 0.0f;
+            Obstacle_Reset();
+            enc_l_prev = (uint16_t)TIM1->CNT;
+            enc_r_prev = (uint16_t)TIM8->CNT;
         }
 
         btn_prev = btn_state;
@@ -398,24 +854,198 @@ int main(void)
             uint8_t gray = Gray_Read();
             float   error = Line_GetError(gray);
 
-            /* 固定 PD */
+            /* 每周期读取双编码器增量，int16 转换可处理 16-bit 回绕。 */
+            uint16_t enc_l_now = (uint16_t)TIM1->CNT;
+            uint16_t enc_r_now = (uint16_t)TIM8->CNT;
+            int16_t enc_l_delta = (int16_t)(enc_l_now - enc_l_prev);
+            int16_t enc_r_delta = (int16_t)(enc_r_now - enc_r_prev);
+            enc_l_prev = enc_l_now;
+            enc_r_prev = enc_r_now;
+            uint32_t enc_l_abs =
+                (uint32_t)((enc_l_delta < 0) ? -enc_l_delta : enc_l_delta);
+            uint32_t enc_r_abs =
+                (uint32_t)((enc_r_delta < 0) ? -enc_r_delta : enc_r_delta);
+
+            /*
+             * Obstacle controller owns the motors while bypassing the brick.
+             * Normal line-loss/zigzag logic is intentionally suspended.
+             */
+            if (Obstacle_Update(now, gray)) {
+                if (obstacle_state == OBS_FAILED) {
+                    PID_Reset(&pid_pos);
+                    g_steering = 0.0f;
+                    state = STATE_OOB;
+                }
+                break;
+            }
+
+            if (obstacle_just_completed) {
+                obstacle_just_completed = 0;
+                PID_Reset(&pid_pos);
+                line_lost_cnt = 0;
+                zigzag_dir = 0;
+                zigzag_count = 0;
+                gap_mode = 0;
+                gap_count = 0;
+                gap_encoder_counts = 0;
+            }
+
+            /*
+             * 锯齿路段特征：
+             *   右半 CH5-CH8 全黑且左半未全黑 -> 强制右转
+             *   左半 CH1-CH4 全黑且右半未全黑 -> 强制左转
+             * 全黑 0xFF 不触发，避免把起终点标记误判为锯齿。
+             */
+            uint8_t left_half_black =
+                (gray & SENSOR_LEFT_HALF_MASK) == SENSOR_LEFT_HALF_MASK;
+            uint8_t right_half_black =
+                (gray & SENSOR_RIGHT_HALF_MASK) == SENSOR_RIGHT_HALF_MASK;
+
+            if (right_half_black && !left_half_black) {
+                if (zigzag_dir != 1) {
+                    zigzag_dir = 1;
+                    zigzag_count = 0;
+                }
+            } else if (left_half_black && !right_half_black) {
+                if (zigzag_dir != -1) {
+                    zigzag_dir = -1;
+                    zigzag_count = 0;
+                }
+            }
+
+            if (zigzag_dir != 0) {
+                if (zigzag_count < ZIGZAG_MAX_COUNT) zigzag_count++;
+
+                /*
+                 * 强制转向后，中央重新捕获窄线且半区全黑特征消失，
+                 * 才交还给普通 PD。下一折若出现相反半区全黑，会直接
+                 * 切换方向。
+                 */
+                uint8_t normal_center_reacquired =
+                    (gray & SENSOR_CENTER_MASK) != 0U &&
+                    !left_half_black && !right_half_black &&
+                    error > -18.0f && error < 18.0f;
+
+                if ((zigzag_count >= ZIGZAG_MIN_COUNT &&
+                     normal_center_reacquired) ||
+                    zigzag_count >= ZIGZAG_MAX_COUNT) {
+                    zigzag_dir = 0;
+                    zigzag_count = 0;
+                    if (error != LINE_LOST && error != LINE_FULL) {
+                        pid_pos.prev_error = -error;
+                    }
+                }
+            }
+
+            /*
+             * 赛规直线断线：进入全白前，黑线必须在中央附近且不处于
+             * 锯齿模式。断线期间固定直行，并以双轮平均编码器计数和
+             * 1 秒超时作为双重安全限制。
+             */
+            if (error == LINE_LOST && zigzag_dir == 0 && !gap_mode) {
+                float last_error_abs =
+                    (last_valid_error >= 0.0f)
+                    ? last_valid_error : -last_valid_error;
+                if (last_error_abs <= GAP_ENTRY_ERROR_MM) {
+                    gap_mode = 1;
+                    gap_count = 0;
+                    gap_encoder_counts = 0;
+                    PID_Reset(&pid_pos);
+                }
+            }
+
+            if (gap_mode) {
+                if (error != LINE_LOST && error != LINE_FULL) {
+                    gap_mode = 0;
+                    gap_count = 0;
+                    gap_encoder_counts = 0;
+                    pid_pos.prev_error = -error;
+                } else {
+                    if (gap_count < GAP_MAX_COUNT) gap_count++;
+                    gap_encoder_counts += (enc_l_abs + enc_r_abs) / 2U;
+                    if (gap_count >= GAP_MAX_COUNT ||
+                        gap_encoder_counts >= GAP_MAX_ENCODER_COUNTS) {
+                        Motor_SetPWM(0, 0);
+                        Motor_Brake();
+                        PID_Reset(&pid_pos);
+                        g_steering = 0.0f;
+                        state = STATE_OOB;
+                        break;
+                    }
+                }
+            }
+
+            /*
+             * 感测器靠近车轮，弯道中可能短暂全白。此时沿用最后有效
+             * 转向并降速寻找黑线；持续约 180ms 仍未找回才停车。
+             */
+            if (error == LINE_LOST && zigzag_dir == 0 && !gap_mode) {
+                if (line_lost_cnt < LINE_LOST_GRACE_COUNT) line_lost_cnt++;
+                if (line_lost_cnt >= LINE_LOST_GRACE_COUNT) {
+                    Motor_SetPWM(0, 0);
+                    Motor_Brake();
+                    PID_Reset(&pid_pos);
+                    g_steering = 0.0f;
+                    state = STATE_OOB;
+                    break;
+                }
+            } else {
+                if (line_lost_cnt > 0 && error != LINE_FULL) {
+                    /* 重新捕获黑线时同步 D 项，避免瞬时反向冲击。 */
+                    pid_pos.prev_error = -error;
+                }
+                line_lost_cnt = 0;
+            }
+
             float steering = 0.0f;
             float e_abs = (error > 0) ? error : -error;
 
-            if (error == LINE_LOST || error == LINE_FULL) {
+            if (gap_mode) {
+                steering = 0.0f;
+            } else if (zigzag_dir > 0) {
+                steering = -ZIGZAG_STEERING;
+            } else if (zigzag_dir < 0) {
+                steering = ZIGZAG_STEERING;
+            } else if (error == LINE_LOST) {
+                steering = last_valid_steering * LINE_LOST_STEER_GAIN;
+            } else if (error == LINE_FULL) {
                 steering = 0.0f;
             } else {
                 steering = PID_Compute(&pid_pos, 0.0f, error, dt);
+                /*
+                 * 黑线进入外侧感测器时视为急弯。只在边缘区域增加转向，
+                 * 避免改变直线与普通弯道的手感。
+                 */
+                if (e_abs >= SHARP_TURN_ERROR_MM) {
+                    steering *= SHARP_TURN_GAIN;
+                    if (steering > SHARP_TURN_LIMIT) {
+                        steering = SHARP_TURN_LIMIT;
+                    } else if (steering < -SHARP_TURN_LIMIT) {
+                        steering = -SHARP_TURN_LIMIT;
+                    }
+                }
+                last_valid_steering = steering;
+                last_valid_error = error;
             }
 
             /* 速度曲線: 陡降, 大彎更慢 = 更多修正時間 */
-            float ratio = 1.0f - e_abs * 0.022f;
-            if (ratio < 0.30f) ratio = 0.30f;
+            float ratio = 1.0f - e_abs * 0.014f;
+            if (ratio < 0.35f) ratio = 0.35f;
             uint16_t cur_speed = (uint16_t)((float)FIXED_SPEED * ratio);
+            if (gap_mode) {
+                cur_speed = GAP_CROSS_SPEED;
+            } else if (zigzag_dir != 0) {
+                cur_speed = ZIGZAG_SPEED;
+            } else if (error == LINE_LOST) {
+                cur_speed = LINE_LOST_SPEED;
+            }
 
             /* 馬達輸出 */
             int16_t pwm_l = (int16_t)cur_speed - (int16_t)steering;
             int16_t pwm_r = (int16_t)cur_speed + (int16_t)steering + RIGHT_TRIM;
+            /* 首輪彎道測試不允許單輪反轉，避免直接甩出賽道。 */
+            if (pwm_l < 0) pwm_l = 0;
+            if (pwm_r < 0) pwm_r = 0;
             g_steering = steering;  /* 供 OLED */
             Motor_SetSpeed(pwm_l, pwm_r);
             break;
@@ -428,6 +1058,7 @@ int main(void)
         }
 
         /* ---- OLED 更新 (10Hz) ---- */
+#if OLED_ENABLED
         static uint32_t last_oled;
         if (now - last_oled >= 100) {
             last_oled = now;
@@ -435,6 +1066,7 @@ int main(void)
             float error = Line_GetError(gray);
             OLED_ShowDebug(state, g_steering, FIXED_SPEED, gray, elapsed_ms);
         }
+#endif
     }
 }
 

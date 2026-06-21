@@ -1,12 +1,12 @@
 {
-    "cmake.cmakePath": "cube-cmake",
-    "cmake.configureArgs": [
-        "-DCMAKE_COMMAND=cube-cmake"
-    ],
+    "cmake.cmakePath": "cmake",
+    "cmake.useCMakePresets": "always",
+    "cmake.configureOnOpen": true,
+    "cmake.buildDirectory": "${workspaceFolder}/build/${buildType}",
     "cmake.preferredGenerators": [
         "Ninja"
     ],
-    "stm32-for-vscode.openOCDPath": false,
-    "stm32-for-vscode.makePath": false,
-    "stm32-for-vscode.armToolchainPath": false
+    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+    "cortex-debug.openocdPath": "openocd",
+    "cortex-debug.gdbPath": "arm-none-eabi-gdb"
 }
